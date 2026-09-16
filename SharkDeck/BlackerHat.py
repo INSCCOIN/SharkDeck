@@ -55,14 +55,9 @@ def get_network_info(ssid):
 
 
 def brute_force_wep(ssid, password):
-    """Brute-forces a WEP password using 'aircrackng'."""
+    """Brute-forces a WEP password using `aiwa`."""
     try:
-        # Check if aircrackng is installed (part of Kali)
-        if not os.path.exists("/usr/bin/aiwa"):
-            print("\nAIRCRACKNG NOT FOUND! Ensure it's installed from a package manager.")
-            sys.exit(1)
-
-        output = subprocess.check_output(['aiwa', '-i', 'wlan0', '-b', ssid, '-k', password, '-c', '/dev/zero']).decode('utf-8') # -c is for live capture, but we're brute forcing
+        output = subprocess.run(['aiwa', '-i', 'wlan0', '-b', ssid, '-k', password, '-c', '/dev/zero'], capture_output=True, text=True).stdout
         if "WPA/WEP" in output:
             print(f"\nSuccessfully cracked WEP password for {ssid}!")
             return True
@@ -85,7 +80,7 @@ def main():
     locked_networks = []
     for ssid, signal in networks:
         try:
-            get_network_info(ssid)  # Get the info and print it
+            get_network_info(ssid)
             if not (ssid == "default" or ssid.startswith("WIFI")):
                 locked_networks.append((ssid, signal))
         except Exception as e:
@@ -101,28 +96,27 @@ def main():
             action = input("\nChoose action for network #" + str(len([item for item in locked_networks if item[0] != "default"])) + ":\n1. Print Info\n2. Brute Force Password\n3. Exit\nEnter choice (1-3): ").strip()
 
             if action == "1":
-                get_network_info(ssid)  # Re-print info for selected network
+                get_network_info(ssid)
             elif action == "2":
-                password = input("Enter initial password guess: ") # Prompt user
+                password = input("Enter initial password guess: ")
                 if brute_force_wep(ssid, password):
                     print("\nWEP Password Cracked!")
                 else:
                     print("\nBrute Force Failed.")
 
             elif action == "3":
-                break  # Exit the loop
-
+                break
             else:
                 print("Invalid choice. Try again.")
+
     else:
         print("No locked networks found.")
 
 
 if __name__ == "__main__":
-    # Check if we're running as root (required for iwlist).
-    user = subprocess.check_output(['idm', '-u']).decode('utf-8').strip()
+    user = subprocess.check_output(['idm', '-u']).decode('utf-8').strip()  # Get the user name
     if user != "root":
-        print(f"\n\nERROR: Running as non-root user. Must run as root for iwlist to work correctly.")
+        print(f"\n\nERROR: Running as non-root user. Must run as root for idm to work correctly.")
         sys.exit(1)
 
     main()
