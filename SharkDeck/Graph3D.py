@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """
-Graph3D - 3D Graphing Calculator for SharkDeck
-Port of Picoware Graph3D.py (z = f(x, y))
+Graph3D - Pure Python 3D Surface Plotter for SharkDeck
+No external modules. Terminal ASCII rendering.
 """
 
-import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 import math
 import os
+import sys
+from math import sin, cos, sqrt, exp, log, log10, tan, pi, e, floor, ceil
+from math import asin, acos, atan, atan2, sinh, cosh, tanh
 
-# ====================== SAFE MATH ENVIRONMENT ======================
+# ====================== SAFE FUNCTIONS ======================
 
 SAFE = {
     "abs": abs, "min": min, "max": max, "pow": pow, "round": round,
-    "sin": math.sin, "cos": math.cos, "tan": math.tan,
-    "asin": math.asin, "acos": math.acos, "atan": math.atan, "atan2": math.atan2,
-    "sinh": math.sinh, "cosh": math.cosh, "tanh": math.tanh,
-    "log": math.log, "log10": math.log10, "exp": math.exp, "sqrt": math.sqrt,
-    "pi": math.pi, "e": math.e, "floor": math.floor, "ceil": math.ceil,
-    "math": math,
+    "sin": sin, "cos": cos, "tan": tan,
+    "asin": asin, "acos": acos, "atan": atan, "atan2": atan2,
+    "sinh": sinh, "cosh": cosh, "tanh": tanh,
+    "log": log, "log10": log10, "exp": exp, "sqrt": sqrt,
+    "pi": pi, "e": e, "floor": floor, "ceil": ceil,
 }
 
 PRESETS = [
@@ -30,185 +29,194 @@ PRESETS = [
     ("Sombrero",      "sin(sqrt(x**2+y**2)+0.001)/(sqrt(x**2+y**2)+0.4)"),
     ("Hyperbolic",    "0.18*x*y"),
     ("Gaussian",      "1.6*exp(-(x**2+y**2)/3)"),
-    ("Twin Peaks",    "1.4*(exp(-((x-2)**2+y**2)/2) + exp(-((x+2)**2+y**2)/2))"),
+    ("Twin Peaks",    "1.4*(exp(-((x-2)**2 + y**2)/2) + exp(-((x+2)**2 + y**2)/2))"),
     ("Bowl",          "-0.1*(x**2 + y**2)"),
     ("Checker",       "0.5*sin(2*x)*sin(2*y)"),
-    ("Helix Bowl",    "0.15*(x**2+y**2) + 0.4*sin(3*atan2(y,x))"),
     ("Volcano",       "1.2*exp(-(x**2+y**2)/4) - 0.6*exp(-(x**2+y**2)/0.6)"),
 ]
 
-# ====================== CORE ======================
+# ====================== HELPERS ======================
 
-def clean_expr(expr: str) -> str:
+def clear():
+    os.system("clear" if os.name != "nt" else "cls")
+
+def clean_expr(expr):
     expr = (expr or "").strip()
-    expr = expr.replace("^", "**").replace("×", "*").replace("÷", "/")
+    expr = expr.replace("^", "**")
     low = expr.lower()
     if low.startswith("z=") or low.startswith("f="):
         expr = expr[2:]
     return expr.strip()
 
-def evaluate_surface(expr: str, range_val: float = 4.0, grid_n: int = 40):
-    expr = clean_expr(expr)
-    if not expr:
-        raise ValueError("Empty expression")
-
+def evaluate(expr, x, y):
+    env = dict(SAFE)
+    env["x"] = x
+    env["y"] = y
+    env["r"] = sqrt(x*x + y*y)
     try:
         code = compile(expr, "<expr>", "eval")
-    except Exception as e:
-        raise ValueError(f"Syntax error: {e}")
+        val = eval(code, {"__builtins__": {}}, env)
+        if isinstance(val, (int, float)) and math.isfinite(val):
+            return float(val)
+    except Exception:
+        pass
+    return None
 
-    x = np.linspace(-range_val, range_val, grid_n)
-    y = np.linspace(-range_val, range_val, grid_n)
-    X, Y = np.meshgrid(x, y)
-    Z = np.zeros_like(X)
+# ====================== ASCII 3D RENDERER ======================
 
-    env = dict(SAFE)
-    for i in range(grid_n):
-        for j in range(grid_n):
-            env["x"] = float(X[i, j])
-            env["y"] = float(Y[i, j])
-            env["r"] = math.sqrt(env["x"]**2 + env["y"]**2)
-            try:
-                val = eval(code, {"__builtins__": {}}, env)
-                if isinstance(val, (int, float)) and math.isfinite(val):
-                    Z[i, j] = val
-                else:
-                    Z[i, j] = np.nan
-            except Exception:
-                Z[i, j] = np.nan
+def render_surface(expr, range_val=4.0, width=70, height=28, pitch=0.5, yaw=0.7):
+    expr = clean_expr(expr)
+    if not expr:
+        print("No equation.")
+        return
 
-    return X, Y, Z
+    # Sample grid
+    grid_n = 28
+    zs = []
+    zmin, zmax = 1e9, -1e9
 
-def plot_surface(expr1: str, expr2: str = "", range_val: float = 4.0, grid_n: int = 40):
-    X, Y, Z1 = evaluate_surface(expr1, range_val, grid_n)
+    for j in range(grid_n):
+        row = []
+        y = -range_val + (2 * range_val) * j / (grid_n - 1)
+        for i in range(grid_n):
+            x = -range_val + (2 * range_val) * i / (grid_n - 1)
+            z = evaluate(expr, x, y)
+            row.append(z)
+            if z is not None:
+                zmin = min(zmin, z)
+                zmax = max(zmax, z)
+        zs.append(row)
 
-    fig = plt.figure(figsize=(10, 7))
-    ax = fig.add_subplot(111, projection="3d")
+    if zmax - zmin < 1e-9:
+        zmax = zmin + 1.0
 
-    # Main surface
-    surf1 = ax.plot_surface(X, Y, Z1, cmap="viridis", edgecolor="none", alpha=0.9, label="f(x,y)")
+    # Projection parameters
+    cx, cy = width // 2, height // 2
+    focal = 18.0
+    cam = 9.0
+    scale = 1.0
 
-    # Optional second surface
-    if clean_expr(expr2):
-        try:
-            _, _, Z2 = evaluate_surface(expr2, range_val, grid_n)
-            ax.plot_surface(X, Y, Z2, cmap="plasma", edgecolor="none", alpha=0.6)
-        except Exception as e:
-            print(f"Second equation error: {e}")
+    # Characters from low to high
+    chars = " .:-=+*#%@"
 
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_zlabel("Z")
-    ax.set_title(f"z = {clean_expr(expr1)}" + (f"  |  g = {clean_expr(expr2)}" if clean_expr(expr2) else ""))
+    # Create empty screen
+    screen = [[" " for _ in range(width)] for _ in range(height)]
+    zbuf = [[-1e9 for _ in range(width)] for _ in range(height)]
 
-    # Nice defaults
-    ax.view_init(elev=28, azim=-60)
-    fig.colorbar(surf1, ax=ax, shrink=0.6, label="Height")
+    def project(x, y, z):
+        # Simple rotation
+        cyaw, syaw = cos(yaw), sin(yaw)
+        cpitch, spitch = cos(pitch), sin(pitch)
 
-    plt.tight_layout()
-    plt.show()
+        x1 = x * cyaw - y * syaw
+        z1 = x * syaw + y * cyaw
+        y1 = z
 
-# ====================== MENU ======================
+        y2 = y1 * cpitch - z1 * spitch
+        z2 = y1 * spitch + z1 * cpitch
 
-def clear():
-    os.system("clear" if os.name != "nt" else "cls")
+        zc = cam - z2
+        if zc < 0.5:
+            return None
+        s = (focal * scale) / zc
+        sx = int(cx + x1 * s * 3.2)
+        sy = int(cy - y2 * s * 1.6)
+        return sx, sy, zc
 
-def main_menu():
-    expr1 = "0.6*sin(x)*cos(y)"
-    expr2 = ""
+    # Draw points
+    for j in range(grid_n):
+        for i in range(grid_n):
+            z = zs[j][i]
+            if z is None:
+                continue
+            x = -range_val + (2 * range_val) * i / (grid_n - 1)
+            y = -range_val + (2 * range_val) * j / (grid_n - 1)
+
+            # Normalize height for character
+            t = (z - zmin) / (zmax - zmin)
+            ch = chars[int(t * (len(chars) - 1))]
+
+            p = project(x, y, z * 0.7)
+            if p is None:
+                continue
+            sx, sy, depth = p
+            if 0 <= sx < width and 0 <= sy < height:
+                if depth > zbuf[sy][sx]:
+                    zbuf[sy][sx] = depth
+                    screen[sy][sx] = ch
+
+    # Print
+    print("+" + "-" * width + "+")
+    for row in screen:
+        print("|" + "".join(row) + "|")
+    print("+" + "-" * width + "+")
+    print(f"z = {expr}")
+    print(f"Range ±{range_val}   Height: {zmin:.2f} → {zmax:.2f}")
+
+# ====================== MAIN MENU ======================
+
+def main():
+    expr = "0.6*sin(x)*cos(y)"
     range_val = 4.0
-    grid_n = 40
+    pitch = 0.55
+    yaw = 0.70
 
     while True:
         clear()
-        print("=" * 55)
-        print("          Graph3D - SharkDeck Edition")
-        print("     3D Surface Plotter  (z = f(x, y))")
-        print("=" * 55)
-        print(f"\n  Current f(x,y) : {expr1}")
-        print(f"  Current g(x,y) : {expr2 or '(none)'}")
-        print(f"  Range         : ±{range_val}")
-        print(f"  Grid size     : {grid_n} × {grid_n}")
+        print("=" * 50)
+        print("       Graph3D - SharkDeck (Pure Python)")
+        print("=" * 50)
+        print(f"\n  Current equation : z = {expr}")
+        print(f"  Range            : ±{range_val}")
         print("""
-  1. Plot current equation(s)
-  2. Enter / edit f(x,y)
-  3. Enter / edit g(x,y)   (optional second surface)
-  4. Presets
-  5. Change range
-  6. Change grid resolution
-  7. Help
+  1. Plot
+  2. Enter new equation
+  3. Presets
+  4. Change range
+  5. Rotate view (yaw/pitch)
   0. Exit
         """)
         choice = input("Select: ").strip()
 
         if choice == "1":
+            clear()
             try:
-                print("\nGenerating 3D plot...")
-                plot_surface(expr1, expr2, range_val, grid_n)
+                render_surface(expr, range_val, pitch=pitch, yaw=yaw)
             except Exception as e:
-                print(f"\nError: {e}")
-                input("\nPress Enter...")
+                print(f"Error: {e}")
+            input("\nPress Enter to return...")
 
         elif choice == "2":
-            print("\nEnter equation for z = f(x, y)")
-            print("Examples: sin(x)*cos(y)   |   x**2 - y**2   |   exp(-(x**2+y**2))")
-            new = input("f(x,y) = ").strip()
+            print("\nEnter equation using x and y")
+            print("Example: sin(x)*cos(y)   or   x**2 - y**2")
+            new = input("z = ").strip()
             if new:
-                expr1 = new
+                expr = new
 
         elif choice == "3":
-            print("\nOptional second surface g(x, y)  (leave empty to clear)")
-            new = input("g(x,y) = ").strip()
-            expr2 = new
-
-        elif choice == "4":
             clear()
             print("Presets:\n")
             for i, (name, eq) in enumerate(PRESETS, 1):
-                print(f"  {i:2}. {name:<15} → {eq}")
-            print()
-            sel = input("Choose preset number (or Enter to cancel): ").strip()
+                print(f"  {i:2}. {name:<12} → {eq}")
+            sel = input("\nChoose number: ").strip()
             if sel.isdigit() and 1 <= int(sel) <= len(PRESETS):
-                expr1 = PRESETS[int(sel)-1][1]
-                expr2 = ""
+                expr = PRESETS[int(sel)-1][1]
 
-        elif choice == "5":
+        elif choice == "4":
             try:
-                val = float(input(f"New range (current ±{range_val}): ").strip())
-                if val > 0.1:
+                val = float(input(f"New range (current ±{range_val}): "))
+                if val > 0.2:
                     range_val = val
             except ValueError:
                 pass
 
-        elif choice == "6":
+        elif choice == "5":
             try:
-                val = int(input(f"Grid size (current {grid_n}): ").strip())
-                if 8 <= val <= 120:
-                    grid_n = val
+                print(f"Current yaw={yaw:.2f}, pitch={pitch:.2f}")
+                yaw = float(input("New yaw   (e.g. 0.7): ") or yaw)
+                pitch = float(input("New pitch (e.g. 0.5): ") or pitch)
             except ValueError:
                 pass
-
-        elif choice == "7":
-            clear()
-            print("""
-Graph3D Help
-------------
-• Write any expression using x and y
-• Available functions:
-  sin cos tan asin acos atan atan2
-  sinh cosh tanh
-  log log10 exp sqrt abs floor ceil
-  pi  e
-
-• Use ** for powers   (x**2)
-• You can plot two surfaces at once (f and g)
-
-• In the plot window:
-  - Left mouse  = rotate
-  - Right mouse = zoom
-  - Middle      = pan
-            """)
-            input("\nPress Enter to return...")
 
         elif choice == "0":
             print("\nGoodbye!")
@@ -216,6 +224,6 @@ Graph3D Help
 
 if __name__ == "__main__":
     try:
-        main_menu()
+        main()
     except KeyboardInterrupt:
-        print("\n\nExiting.")
+        print("\n\nExited.")
