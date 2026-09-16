@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+#Hours spent here: 33
+#STG ill never fucking be able to properly write black hat shit
+
+
 import subprocess
 import sys
 import os
