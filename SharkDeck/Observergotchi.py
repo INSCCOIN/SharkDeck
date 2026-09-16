@@ -298,18 +298,20 @@ def main():
         time.sleep(1.5)
 
     auto_mode = False
+    scan_interval = 30  # default
 
     while True:
         pet.update_time()
         draw(pet)
 
         if auto_mode:
-            print("\n  Auto mode active (scanning every 30s). Press Ctrl+C to stop.")
+            print(f"\n  Auto mode active — scanning every {scan_interval} seconds.")
+            print("  Press Ctrl+C to stop auto mode.")
             try:
                 networks = passive_scan()
                 new_s, new_b, opens = observe(pet, networks)
                 print(f"\n  → Seen {len(networks)} networks | +{new_s} new SSIDs | {opens} open")
-                time.sleep(30)
+                time.sleep(scan_interval)
                 continue
             except KeyboardInterrupt:
                 auto_mode = False
@@ -328,7 +330,21 @@ def main():
             time.sleep(1.8)
 
         elif choice == "a":
-            auto_mode = True
+            try:
+                user_input = input(f"  Scan interval in seconds [{scan_interval}]: ").strip()
+                if user_input:
+                    val = int(user_input)
+                    if val < 5:
+                        print("  Minimum interval is 5 seconds.")
+                        time.sleep(1.2)
+                        continue
+                    scan_interval = val
+                auto_mode = True
+                print(f"\n  Auto mode started (every {scan_interval}s)")
+                time.sleep(1)
+            except ValueError:
+                print("  Please enter a valid number.")
+                time.sleep(1)
 
         elif choice == "r":
             new_name = input("  New name: ").strip()
