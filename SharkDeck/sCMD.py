@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 # Version 1.3
 #!/usr/bin/env python3
 # sCMD — dual-pane DOS-style file commander for SharkDeck.
