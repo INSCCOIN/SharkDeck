@@ -1,34 +1,28 @@
 #!/usr/bin/env python3
-"""dbrowser — 48-col text browser for SharkDeck.
+"""dbrowser GUI — tiny Tk front end for SharkDeck (480x320).
 
-Stdlib only. No JS, no CSS layout.
+No WebKit. Fetches HTML and shows text + a link list.
+Needs python3-tk and a display ($DISPLAY).
 
-  dbrowser
-  dbrowser https://example.com
-  dbrowser file:///home/working/index.html
+  dbrowser-gui
+  dbrowser-gui https://example.com
 """
 
-import curses
 import html
 import os
 import re
 import sys
-import urllib.error
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 
 NAME = "dbrowser"
-COLS_SOFT = 48
+GEOM = "480x304+0+0"
+FONT = ("TkFixedFont", 8)
 MAX_BODY = 400000
 TIMEOUT = 15
 BM_FILE = os.path.expanduser("~/.dbrowser.bookmarks")
-UA = "dbrowser/1.0 (SharkDeck; +https://sharkdeck.dev/docs)"
-
-
-def clip(s, n):
-    s = " ".join(s.split())
-    return s if len(s) <= n else s[: n - 1] + "~"
+UA = "dbrowser/1.0 (SharkDeck GUI)"
 
 
 class PageParser(HTMLParser):
@@ -59,8 +53,7 @@ class PageParser(HTMLParser):
         if tag == "li":
             self.chunks.append(" * ")
         if tag == "a":
-            href = attrs.get("href") or ""
-            self._href = urllib.parse.urljoin(self.base, href)
+            self._href = urllib.parse.urljoin(self.base, attrs.get("href") or "")
             self._link_text = []
 
     def handle_endtag(self, tag):
@@ -73,9 +66,8 @@ class PageParser(HTMLParser):
             self._intitle = False
         if tag == "a" and self._href:
             text = " ".join("".join(self._link_text).split()) or self._href
-            n = len(self.links) + 1
-            self.links.append((n, text, self._href))
-            self.chunks.append("[%d %s]" % (n, text))
+            self.links.append((text, self._href))
+            self.chunks.append("[%s]" % text)
             self._href = None
             self._link_text = []
 
@@ -91,256 +83,160 @@ class PageParser(HTMLParser):
         self.chunks.append(data)
 
 
-def fetch(url):
+def fetch_page(url):
+    if "://" not in url:
+        url = "https://" + url
     if url.startswith("file://"):
         path = urllib.parse.urlparse(url).path
-        with open(path, "rb") as fh:
-            raw = fh.read(MAX_BODY)
-        return raw, "text/html"
+        raw = open(path, "rb").read(MAX_BODY)
+        return url, raw, "text/html"
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        ctype = resp.headers.get_content_type() or "text/html"
-        raw = resp.read(MAX_BODY)
-        final = resp.geturl()
-    return raw, ctype, final
+        return resp.geturl(), resp.read(MAX_BODY), (resp.headers.get_content_type() or "text/html")
 
 
-def load(url):
-    raw = ctype = final = None
+def parse_page(url):
     try:
-        got = fetch(url)
-        if len(got) == 2:
-            raw, ctype = got
-            final = url
-        else:
-            raw, ctype, final = got
+        final, raw, ctype = fetch_page(url)
     except Exception as exc:
-        return {"url": url, "title": "error", "lines": [str(exc)], "links": []}
-    if ctype and ctype.startswith("text/plain"):
+        return {"url": url, "title": "error", "text": str(exc), "links": []}
+    if ctype.startswith("text/plain"):
         text = raw.decode("utf-8", errors="replace")
-        return {"url": final, "title": final, "lines": wrap(text), "links": []}
-    html_text = raw.decode("utf-8", errors="replace")
+        return {"url": final, "title": final, "text": text, "links": []}
     p = PageParser(final)
     try:
-        p.feed(html_text)
+        p.feed(raw.decode("utf-8", errors="replace"))
         p.close()
     except Exception:
         pass
     text = html.unescape("".join(p.chunks))
     text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
     title = " ".join(p.title.split()) or final
-    return {"url": final, "title": title, "lines": wrap(text.strip()), "links": p.links}
-
-
-def wrap(text, width=COLS_SOFT):
-    lines = []
-    for para in text.splitlines() or [""]:
-        para = para.rstrip()
-        if not para:
-            lines.append("")
-            continue
-        while para:
-            if len(para) <= width:
-                lines.append(para)
-                break
-            cut = para.rfind(" ", 0, width)
-            if cut < 8:
-                cut = width
-            lines.append(para[:cut])
-            para = para[cut:].lstrip()
-    return lines or [""]
+    return {"url": final, "title": title, "text": text, "links": p.links}
 
 
 def read_bm():
     if not os.path.exists(BM_FILE):
-        return [
-            ("example", "https://example.com"),
-            ("sharkdeck docs", "https://sharkdeck.dev/docs"),
-        ]
-    out = []
-    with open(BM_FILE, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#") or "|" not in line:
-                continue
-            name, url = line.split("|", 1)
-            out.append((name.strip(), url.strip()))
-    return out
+        return [("example", "https://example.com"), ("docs", "https://sharkdeck.dev/docs")]
+    rows = []
+    for line in open(BM_FILE, encoding="utf-8"):
+        line = line.strip()
+        if line and not line.startswith("#") and "|" in line:
+            n, u = line.split("|", 1)
+            rows.append((n.strip(), u.strip()))
+    return rows
 
 
 def write_bm(rows):
     with open(BM_FILE, "w", encoding="utf-8") as fh:
-        for name, url in rows:
-            fh.write("%s|%s\n" % (name, url))
-
-
-class App:
-    def __init__(self, start):
-        self.stack = []
-        self.fwd = []
-        self.page = load(start)
-        self.scroll = 0
-        self.msg = self.page["url"]
-
-    def go(self, url, push=True):
-        if not url:
-            return
-        if "://" not in url:
-            if self.page.get("url"):
-                url = urllib.parse.urljoin(self.page["url"], url)
-            else:
-                url = "https://" + url
-        if push and self.page:
-            self.stack.append(self.page)
-            self.fwd.clear()
-        self.page = load(url)
-        self.scroll = 0
-        self.msg = self.page["url"]
-
-    def back(self):
-        if not self.stack:
-            self.msg = "no back"
-            return
-        self.fwd.append(self.page)
-        self.page = self.stack.pop()
-        self.scroll = 0
-        self.msg = self.page["url"]
-
-    def draw(self, stdscr):
-        h, w = stdscr.getmaxyx()
-        stdscr.erase()
-        title = clip(self.page.get("title") or NAME, w)
-        try:
-            stdscr.addnstr(0, 0, title.ljust(w)[:w], w, curses.A_REVERSE)
-        except curses.error:
-            pass
-        body_h = max(1, h - 3)
-        lines = self.page.get("lines") or [""]
-        if self.scroll > max(0, len(lines) - body_h):
-            self.scroll = max(0, len(lines) - body_h)
-        for i in range(body_h):
-            li = self.scroll + i
-            if li >= len(lines):
-                break
-            try:
-                stdscr.addnstr(1 + i, 0, lines[li][:w], w)
-            except curses.error:
-                pass
-        bar = "g go  # link  b back  m mark  B marks  q"
-        try:
-            stdscr.addnstr(h - 2, 0, clip(self.msg, w).ljust(w)[:w], w, curses.A_REVERSE)
-            stdscr.addnstr(h - 1, 0, bar[:w].ljust(w)[:w], w)
-        except curses.error:
-            pass
-        stdscr.refresh()
-
-    def prompt(self, stdscr, title, default=""):
-        curses.echo()
-        curses.curs_set(1)
-        h, w = stdscr.getmaxyx()
-        stdscr.addnstr(h - 1, 0, " " * w, w)
-        stdscr.addnstr(h - 1, 0, (title + " ")[:w], w)
-        stdscr.refresh()
-        try:
-            raw = stdscr.getstr(h - 1, min(w - 1, len(title) + 1), max(8, w - 12))
-            text = raw.decode("utf-8", errors="replace").strip()
-        except Exception:
-            text = ""
-        curses.noecho()
-        curses.curs_set(0)
-        return text or None
-
-    def pick(self, stdscr, title, rows):
-        if not rows:
-            self.msg = "empty"
-            return None
-        h, w = stdscr.getmaxyx()
-        cur = 0
-        while True:
-            stdscr.erase()
-            stdscr.addnstr(0, 0, title[:w], w, curses.A_REVERSE)
-            vis = h - 2
-            top = max(0, min(cur - vis + 1, max(0, len(rows) - vis)))
-            for i in range(vis):
-                idx = top + i
-                if idx >= len(rows):
-                    break
-                attr = curses.A_REVERSE if idx == cur else curses.A_NORMAL
-                stdscr.addnstr(1 + i, 0, rows[idx][:w], w, attr)
-            stdscr.refresh()
-            k = stdscr.getch()
-            if k in (27, ord("q")):
-                return None
-            if k == curses.KEY_UP:
-                cur = max(0, cur - 1)
-            elif k == curses.KEY_DOWN:
-                cur = min(len(rows) - 1, cur + 1)
-            elif k in (10, 13):
-                return cur
-
-    def run(self, stdscr):
-        curses.curs_set(0)
-        curses.use_default_colors()
-        while True:
-            self.draw(stdscr)
-            k = stdscr.getch()
-            if k in (ord("q"), 27):
-                break
-            elif k == curses.KEY_DOWN:
-                self.scroll += 1
-            elif k == curses.KEY_UP:
-                self.scroll = max(0, self.scroll - 1)
-            elif k == curses.KEY_NPAGE:
-                self.scroll += 8
-            elif k == curses.KEY_PPAGE:
-                self.scroll = max(0, self.scroll - 8)
-            elif k == ord("b"):
-                self.back()
-            elif k == ord("g"):
-                url = self.prompt(stdscr, "url", self.page.get("url") or "")
-                if url:
-                    self.go(url)
-            elif k == ord("m"):
-                name = self.prompt(stdscr, "mark name", self.page.get("title") or "page")
-                if name:
-                    rows = read_bm()
-                    rows.append((name, self.page.get("url") or ""))
-                    write_bm(rows)
-                    self.msg = "marked"
-            elif k == ord("B"):
-                rows = read_bm()
-                labels = ["%s  %s" % (n, u) for n, u in rows]
-                idx = self.pick(stdscr, "bookmarks", labels)
-                if idx is not None:
-                    self.go(rows[idx][1])
-            elif k in (ord("l"), ord("#")):
-                if not self.page.get("links"):
-                    self.msg = "no links"
-                    continue
-                labels = ["%d %s" % (n, clip(t, 40)) for n, t, _u in self.page["links"]]
-                idx = self.pick(stdscr, "links", labels)
-                if idx is not None:
-                    self.go(self.page["links"][idx][2])
-            elif ord("1") <= k <= ord("9"):
-                n = k - ord("0")
-                hits = [u for num, _t, u in self.page.get("links") or [] if num == n]
-                if hits:
-                    self.go(hits[0])
-                else:
-                    self.msg = "no [%d]" % n
+        for n, u in rows:
+            fh.write("%s|%s\n" % (n, u))
 
 
 def main():
+    try:
+        import tkinter as tk
+        from tkinter import simpledialog
+        from tkinter.scrolledtext import ScrolledText
+    except ImportError:
+        sys.stderr.write("need python3-tk:  apt install -y python3-tk\n")
+        return 2
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        sys.stderr.write("no DISPLAY. start X or use: dbrowser URL\n")
+        return 2
+
     start = sys.argv[1] if len(sys.argv) > 1 else "https://example.com"
-    if not sys.stdout.isatty():
-        page = load(start)
-        print(page["title"])
-        print(page["url"])
-        print()
-        print("\n".join(page["lines"][:40]))
-        return 0
-    curses.wrapper(lambda s: App(start).run(s))
+    hist = []
+
+    root = tk.Tk()
+    root.title(NAME)
+    root.geometry(GEOM)
+    root.resizable(True, True)
+
+    top = tk.Frame(root)
+    top.pack(fill="x")
+    url_var = tk.StringVar(value=start)
+
+    body = ScrolledText(root, font=FONT, wrap="word", height=10)
+    links = tk.Listbox(root, font=FONT, height=5)
+
+    def show(page):
+        url_var.set(page["url"])
+        root.title(clip := (page["title"][:40] or NAME))
+        body.delete("1.0", "end")
+        body.insert("1.0", page["text"] or "(empty)")
+        links.delete(0, "end")
+        for text, href in page["links"][:80]:
+            links.insert("end", text[:60])
+        links.links = page["links"][:80]
+        body.see("1.0")
+
+    def go(url=None, push=True):
+        url = (url or url_var.get()).strip()
+        if not url:
+            return
+        if push and url_var.get():
+            hist.append(url_var.get())
+        root.config(cursor="watch")
+        root.update_idletasks()
+        page = parse_page(url)
+        root.config(cursor="")
+        show(page)
+
+    def back():
+        if not hist:
+            return
+        go(hist.pop(), push=False)
+
+    def follow(_evt=None):
+        sel = links.curselection()
+        if not sel:
+            return
+        href = links.links[sel[0]][1]
+        go(href)
+
+    def mark():
+        name = simpledialog.askstring(NAME, "bookmark name", parent=root)
+        if name:
+            rows = read_bm()
+            rows.append((name, url_var.get()))
+            write_bm(rows)
+
+    def marks():
+        rows = read_bm()
+        if not rows:
+            return
+        win = tk.Toplevel(root)
+        win.title("marks")
+        win.geometry("420x200")
+        lb = tk.Listbox(win, font=FONT)
+        lb.pack(fill="both", expand=True)
+        for n, u in rows:
+            lb.insert("end", "%s  %s" % (n, u))
+
+        def pick(_e=None):
+            i = lb.curselection()
+            if i:
+                go(rows[i[0]][1])
+                win.destroy()
+
+        lb.bind("<Double-1>", pick)
+        tk.Button(win, text="open", command=pick).pack()
+
+    tk.Button(top, text="back", command=back, font=FONT).pack(side="left")
+    tk.Button(top, text="go", command=go, font=FONT).pack(side="right")
+    tk.Button(top, text="mark", command=mark, font=FONT).pack(side="right")
+    tk.Button(top, text="marks", command=marks, font=FONT).pack(side="right")
+    entry = tk.Entry(top, textvariable=url_var, font=FONT)
+    entry.pack(side="left", fill="x", expand=True, padx=2)
+    entry.bind("<Return>", lambda e: go())
+    body.pack(fill="both", expand=True)
+    links.pack(fill="x")
+    links.bind("<Double-1>", follow)
+
+    root.after(100, lambda: go(start, push=False))
+    root.mainloop()
     return 0
 
 
