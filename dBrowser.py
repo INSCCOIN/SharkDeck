@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""dbrowser GUI — 480x320 Tk browser for SharkDeck. No WebKit."""
+"""dBrowser — compact text+thumb browser for SharkDeck 480x320."""
 
 import html
 import os
@@ -9,16 +9,20 @@ import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 
-NAME = "dbrowser"
-GEOM = "480x320+0+0"
-FONT = ("TkFixedFont", 8)
-MAX_BODY = 500000
-TIMEOUT = 15
+NAME = "dBrowser"
 HOME = "https://example.com"
 SEARCH = "https://lite.duckduckgo.com/lite/?q=%s"
-BM_FILE = os.path.expanduser("~/.dbrowser.bookmarks")
-HIST_FILE = os.path.expanduser("~/.dbrowser.history")
-UA = "dbrowser/1.1 (SharkDeck GUI)"
+BM = os.path.expanduser("~/.dbrowser.bookmarks")
+HIST = os.path.expanduser("~/.dbrowser.history")
+UA = "dBrowser/2 (SharkDeck)"
+MAX_BODY = 350000
+CACHE_N = 6
+THUMB_N = 4
+THUMB_PX = 64
+THUMB_B = 20000
+
+OPENER = urllib.request.build_opener()
+OPENER.addheaders = [("User-Agent", UA)]
 
 
 class PageParser(HTMLParser):
@@ -28,34 +32,36 @@ class PageParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.base = base
         self.skip = 0
-        self.chunks = []
+        self.buf = []
         self.links = []
         self.images = []
         self.title = ""
-        self._intitle = False
+        self._title = False
         self._href = None
-        self._link_text = []
+        self._ltxt = []
 
     def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        if tag in self.SKIP:
-            self.skip += 1
-            return
         if self.skip:
+            if tag in self.SKIP:
+                self.skip += 1
             return
+        if tag in self.SKIP:
+            self.skip = 1
+            return
+        ad = dict(attrs)
         if tag == "title":
-            self._intitle = True
-        if tag in ("p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "section"):
-            self.chunks.append("\n")
-        if tag == "li":
-            self.chunks.append(" * ")
-        if tag == "img":
-            src = attrs.get("src") or attrs.get("data-src") or ""
+            self._title = True
+        elif tag in ("p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "section", "blockquote"):
+            self.buf.append("\n")
+            if tag == "li":
+                self.buf.append("* ")
+        elif tag == "img":
+            src = ad.get("src") or ad.get("data-src") or ""
             if src and not src.startswith("data:"):
                 self.images.append(urllib.parse.urljoin(self.base, src))
-        if tag == "a":
-            self._href = urllib.parse.urljoin(self.base, attrs.get("href") or "")
-            self._link_text = []
+        elif tag == "a":
+            self._href = urllib.parse.urljoin(self.base, ad.get("href") or "")
+            self._ltxt = []
 
     def handle_endtag(self, tag):
         if tag in self.SKIP and self.skip:
@@ -64,369 +70,393 @@ class PageParser(HTMLParser):
         if self.skip:
             return
         if tag == "title":
-            self._intitle = False
-        if tag == "a" and self._href:
-            text = " ".join("".join(self._link_text).split()) or self._href
-            self.links.append((text, self._href))
-            self.chunks.append("[%s]" % text)
+            self._title = False
+        elif tag == "a" and self._href:
+            lab = " ".join("".join(self._ltxt).split()) or self._href
+            self.links.append((lab, self._href))
+            self.buf.append("<%s>" % lab)
             self._href = None
-            self._link_text = []
 
     def handle_data(self, data):
         if self.skip:
             return
-        if self._intitle:
+        if self._title:
             self.title += data
-            return
-        if self._href is not None:
-            self._link_text.append(data)
-            return
-        self.chunks.append(data)
-
-
-def fetch_page(url):
-    if "://" not in url:
-        if " " in url or "." not in url:
-            url = SEARCH % urllib.parse.quote_plus(url)
+        elif self._href is not None:
+            self._ltxt.append(data)
         else:
-            url = "https://" + url
+            self.buf.append(data)
+
+
+def resolve(raw, current=""):
+    raw = (raw or "").strip()
+    if not raw:
+        return current
+    if "://" in raw or raw.startswith("file:"):
+        return raw
+    if " " in raw or "." not in raw:
+        return SEARCH % urllib.parse.quote_plus(raw)
+    return "https://" + raw
+
+
+def http_get(url, limit=MAX_BODY, timeout=12):
     if url.startswith("file://"):
-        path = urllib.parse.urlparse(url).path
-        raw = open(path, "rb").read(MAX_BODY)
-        return url, raw, "text/html"
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        return resp.geturl(), resp.read(MAX_BODY), (resp.headers.get_content_type() or "text/html")
-
-
-def parse_page(url):
+        data = open(urllib.parse.urlparse(url).path, "rb").read(limit)
+        return url, data, "text/html"
+    resp = OPENER.open(url, timeout=timeout)
     try:
-        final, raw, ctype = fetch_page(url)
+        return resp.geturl(), resp.read(limit), (resp.headers.get_content_type() or "text/html")
+    finally:
+        resp.close()
+
+
+def load_page(url):
+    try:
+        final, raw, ctype = http_get(url)
     except Exception as exc:
         return {"url": url, "title": "error", "text": str(exc), "links": [], "images": []}
     if ctype.startswith("text/plain"):
-        text = raw.decode("utf-8", errors="replace")
-        return {"url": final, "title": final, "text": text, "links": [], "images": []}
+        return {
+            "url": final, "title": final,
+            "text": raw.decode("utf-8", "replace"), "links": [], "images": [],
+        }
     p = PageParser(final)
     try:
-        p.feed(raw.decode("utf-8", errors="replace"))
+        p.feed(raw.decode("utf-8", "replace"))
         p.close()
     except Exception:
         pass
-    text = html.unescape("".join(p.chunks))
+    text = html.unescape("".join(p.buf))
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    title = " ".join(p.title.split()) or final
-    imgs = []
-    seen = set()
+    seen, imgs = set(), []
     for src in p.images:
         if src not in seen:
             seen.add(src)
             imgs.append(src)
     return {
         "url": final,
-        "title": title,
+        "title": " ".join(p.title.split()) or final,
         "text": text,
         "links": p.links,
         "images": imgs[:8],
     }
 
 
-def read_lines(path, fallback=None):
+def read_kv(path):
     if not os.path.exists(path):
-        return list(fallback or [])
-    rows = []
-    for line in open(path, encoding="utf-8"):
-        line = line.strip()
-        if line and not line.startswith("#") and "|" in line:
-            a, b = line.split("|", 1)
-            rows.append((a.strip(), b.strip()))
-    return rows
+        return []
+    out = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line and "|" in line and not line.startswith("#"):
+                a, b = line.split("|", 1)
+                out.append((a.strip(), b.strip()))
+    return out
 
 
-def fetch_thumb(url, max_px=72, max_bytes=25000):
-    """Tiny image for the text widget. Prefer Pillow; GIF/PNG via Tk."""
+def write_kv(path, rows, cap=50):
+    with open(path, "w", encoding="utf-8") as fh:
+        for a, b in rows[:cap]:
+            fh.write("%s|%s\n" % (a, b))
+
+
+def thumb(url):
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            data = resp.read(max_bytes + 1)
-            ctype = (resp.headers.get_content_type() or "").lower()
-        if len(data) > max_bytes:
-            return None
+        _u, data, ctype = http_get(url, limit=THUMB_B, timeout=5)
     except Exception:
         return None
-    tmp = "/tmp/dbrowser-thumb"
+    if len(data) >= THUMB_B:
+        return None
     try:
         from PIL import Image, ImageTk
         import io
         im = Image.open(io.BytesIO(data))
-        im.thumbnail((max_px, max_px))
+        im.thumbnail((THUMB_PX, THUMB_PX))
         if im.mode not in ("RGB", "RGBA"):
             im = im.convert("RGB")
         return ImageTk.PhotoImage(im)
     except Exception:
         pass
-    if "gif" in ctype or "png" in ctype or url.lower().endswith((".gif", ".png")):
-        try:
-            import tkinter as tk
-            ext = ".gif" if "gif" in ctype or url.lower().endswith(".gif") else ".png"
-            path = tmp + ext
-            open(path, "wb").write(data)
-            img = tk.PhotoImage(file=path)
-            factor = max(1, int(max(img.width(), img.height()) / float(max_px)))
-            if factor > 1:
-                img = img.subsample(factor, factor)
-            return img
-        except Exception:
-            return None
-    return None
-
-
-def write_lines(path, rows, cap=80):
-    with open(path, "w", encoding="utf-8") as fh:
-        for a, b in rows[:cap]:
-            fh.write("%s|%s\n" % (a, b))
+    if "png" not in ctype and "gif" not in ctype:
+        return None
+    try:
+        import tkinter as tk
+        path = "/tmp/dbr" + (".gif" if "gif" in ctype else ".png")
+        open(path, "wb").write(data)
+        img = tk.PhotoImage(file=path)
+        f = max(1, max(img.width(), img.height()) // THUMB_PX)
+        return img.subsample(f, f) if f > 1 else img
+    except Exception:
+        return None
 
 
 def main():
     try:
         import tkinter as tk
         from tkinter import simpledialog, filedialog
-        from tkinter.scrolledtext import ScrolledText
     except ImportError:
         sys.stderr.write("apt install -y python3-tk\n")
         return 2
 
-    start = sys.argv[1] if len(sys.argv) > 1 else HOME
+    start = resolve(sys.argv[1] if len(sys.argv) > 1 else HOME)
+    cache = {}
+    order = []
     hist = []
     page = {"url": start, "title": NAME, "text": "", "links": [], "images": []}
-    find_pos = "1.0"
-    thumbs = []
-    body_links = []
+    photos = []
+    tagged = []
+    find_at = "1.0"
+    show_pics = False
 
+    BG, FG, ACC, BAR = "#111111", "#e6e6e6", "#7ad", "#1c1c1c"
     root = tk.Tk()
     root.title(NAME)
-    root.geometry(GEOM)
-    root.minsize(480, 280)
+    root.geometry("480x320+0+0")
+    root.configure(bg=BG)
+    root.option_add("*Font", "TkFixedFont 9")
+    root.option_add("*Background", BG)
+    root.option_add("*Foreground", FG)
+    root.option_add("*Entry.Background", "#000000")
+    root.option_add("*Entry.Foreground", FG)
+    root.option_add("*Text.Background", "#000000")
+    root.option_add("*Text.Foreground", FG)
+    root.option_add("*Listbox.Background", "#000000")
+    root.option_add("*Listbox.Foreground", FG)
+    root.option_add("*Button.Background", BAR)
+    root.option_add("*Button.Foreground", ACC)
+    root.option_add("*Button.Relief", "flat")
+    root.option_add("*Button.BorderWidth", 0)
+    root.option_add("*HighlightThickness", 0)
 
-    url_var = tk.StringVar(value=start)
-    status = tk.StringVar(value="ready")
+    urlv = tk.StringVar(value=start)
+    stv = tk.StringVar(value="")
 
-    top = tk.Frame(root)
-    top.pack(fill="x")
-    mid = tk.Frame(root)
-    mid.pack(fill="x")
-    body = ScrolledText(root, font=FONT, wrap="word", height=9)
+    bar = tk.Frame(root, bg=BAR)
+    bar.pack(fill="x")
+    body = tk.Text(root, wrap="word", bd=0, highlightthickness=0, undo=False, height=12)
     body.pack(fill="both", expand=True)
-    links = tk.Listbox(root, font=FONT, height=4)
-    links.pack(fill="x")
-    tk.Label(root, textvariable=status, font=FONT, anchor="w").pack(fill="x")
+    yscroll = tk.Scrollbar(body, command=body.yview, bg=BAR, troughcolor=BG, width=8)
+    body.configure(yscrollcommand=yscroll.set)
+    yscroll.pack(side="right", fill="y")
+    lst = tk.Listbox(root, height=3, bd=0, highlightthickness=0, activestyle="none")
+    lst.pack(fill="x")
+    tk.Label(root, textvariable=stv, bg=BAR, fg="#888888", anchor="w").pack(fill="x")
 
-    def set_status(msg):
-        status.set(msg[:70])
+    def say(msg):
+        stv.set(msg[:72])
         root.update_idletasks()
 
-    def click_body_link(event):
-        idx = body.index("@%d,%d" % (event.x, event.y))
-        tags = body.tag_names(idx)
-        for t in tags:
-            if t.startswith("lnk"):
-                i = int(t[3:])
-                if 0 <= i < len(body_links):
-                    go(body_links[i])
+    def b(txt, cmd):
+        w = tk.Button(bar, text=txt, command=cmd, padx=4, pady=1)
+        w.pack(side="left")
+        return w
+
+    def put_cache(p):
+        cache[p["url"]] = p
+        if p["url"] in order:
+            order.remove(p["url"])
+        order.append(p["url"])
+        while len(order) > CACHE_N:
+            cache.pop(order.pop(0), None)
+
+    def click_tag(e):
+        names = body.tag_names(body.index("@%d,%d" % (e.x, e.y)))
+        for t in names:
+            if t.startswith("a") and t[1:].isdigit():
+                i = int(t[1:])
+                if i < len(tagged):
+                    go(tagged[i])
                 return
 
-    def show(p):
-        nonlocal page, find_pos, thumbs, body_links
+    def paint(p):
+        nonlocal page, tagged, photos, find_at
         page = p
-        url_var.set(p["url"])
+        urlv.set(p["url"])
         root.title((p["title"] or NAME)[:48])
-        for t in list(body.tag_names()):
-            if t.startswith("lnk"):
-                body.tag_delete(t)
         body.delete("1.0", "end")
-        text = p.get("text") or "(empty)"
+        for t in body.tag_names():
+            if t.startswith("a"):
+                body.tag_delete(t)
+        text = p["text"] or "(empty)"
         body.insert("1.0", text)
-        body_links = []
-        search_from = "1.0"
-        for lab, href in (p.get("links") or [])[:80]:
-            needle = "[" + lab + "]"
-            idx = body.search(needle, search_from, "end")
+        tagged = []
+        at = "1.0"
+        for lab, href in p["links"][:60]:
+            needle = "<%s>" % lab
+            idx = body.search(needle, at, "end")
             if not idx:
                 continue
             end = "%s+%dc" % (idx, len(needle))
-            tag = "lnk%d" % len(body_links)
+            tag = "a%d" % len(tagged)
             body.tag_add(tag, idx, end)
-            body.tag_config(tag, foreground="blue", underline=1)
-            body.tag_bind(tag, "<Button-1>", click_body_link)
-            body_links.append(href)
-            search_from = end
-        thumbs = []
-        imgs = p.get("images") or []
-        if imgs:
-            body.insert("end", "\n\n")
-            set_status("thumbs %d..." % len(imgs))
-            root.update_idletasks()
-            for src in imgs[:5]:
-                im = fetch_thumb(src)
-                if im is None:
-                    continue
-                thumbs.append(im)
-                body.image_create("end", image=im)
-                body.insert("end", " ")
-        links.delete(0, "end")
-        links.links = p.get("links") or []
-        links.links = links.links[:100]
-        for i, (text_l, href) in enumerate(links.links, 1):
-            links.insert("end", "%d %s" % (i, text_l[:50]))
-        find_pos = "1.0"
-        set_status("%d links  %d imgs" % (len(p.get("links") or []), len(thumbs)))
+            body.tag_config(tag, foreground=ACC, underline=1)
+            body.tag_bind(tag, "<Button-1>", click_tag)
+            tagged.append(href)
+            at = end
+        photos = []
+        if show_pics:
+            for src in p["images"][:THUMB_N]:
+                im = thumb(src)
+                if im:
+                    photos.append(im)
+                    body.insert("end", "\n")
+                    body.image_create("end", image=im)
+        lst.delete(0, "end")
+        lst.urls = [h for _l, h in p["links"][:80]]
+        for i, (lab, _h) in enumerate(p["links"][:80], 1):
+            lst.insert("end", "%d %s" % (i, lab[:44]))
+        find_at = "1.0"
+        say("%d links   j/k scroll  1-9 open  / find  g url" % len(p["links"]))
         body.see("1.0")
-
-    def remember(url, title):
-        rows = read_lines(HIST_FILE, [])
-        rows = [(title or url, url)] + [r for r in rows if r[1] != url]
-        write_lines(HIST_FILE, rows, 60)
+        body.focus_set()
 
     def go(url=None, push=True):
-        url = (url if url is not None else url_var.get()).strip()
+        url = resolve(url if url is not None else urlv.get(), page.get("url"))
         if not url:
             return
-        if push and page.get("url"):
+        if push and page.get("url") and page["url"] != url:
             hist.append(page["url"])
-        set_status("loading...")
+        if url in cache:
+            paint(cache[url])
+            return
+        say("...")
         root.config(cursor="watch")
         root.update()
-        p = parse_page(url)
+        p = load_page(url)
         root.config(cursor="")
-        show(p)
-        remember(p["url"], p["title"])
+        put_cache(p)
+        rows = read_kv(HIST)
+        rows = [(p["title"], p["url"])] + [r for r in rows if r[1] != p["url"]]
+        write_kv(HIST, rows)
+        paint(p)
 
     def back():
         if hist:
             go(hist.pop(), push=False)
 
-    def home():
-        go(HOME)
-
-    def reload_page():
-        go(url_var.get(), push=False)
+    def ask(title):
+        return simpledialog.askstring(NAME, title, parent=root)
 
     def search():
-        q = simpledialog.askstring(NAME, "search", parent=root)
+        q = ask("search")
         if q:
             go(SEARCH % urllib.parse.quote_plus(q))
 
-    def follow(_e=None):
-        sel = links.curselection()
-        if sel:
-            go(links.links[sel[0]][1])
-
-    def mark():
-        name = simpledialog.askstring(NAME, "bookmark name", parent=root, initialvalue=page.get("title") or "")
-        if name:
-            rows = read_lines(BM_FILE, [("example", "https://example.com")])
-            rows.append((name, url_var.get()))
-            write_lines(BM_FILE, rows)
-
-    def pick_list(title, rows):
-        if not rows:
-            set_status("empty")
-            return
-        win = tk.Toplevel(root)
-        win.title(title)
-        win.geometry("460x220+0+20")
-        lb = tk.Listbox(win, font=FONT)
-        lb.pack(fill="both", expand=True)
-        for n, u in rows:
-            lb.insert("end", "%s  %s" % (n[:24], u[:40]))
-
-        def pick(_e=None):
-            i = lb.curselection()
-            if i:
-                go(rows[i[0]][1])
-                win.destroy()
-
-        lb.bind("<Double-1>", pick)
-        lb.bind("<Return>", pick)
-        tk.Button(win, text="open", command=pick, font=FONT).pack()
-
-    def marks():
-        pick_list("marks", read_lines(BM_FILE, [("example", HOME)]))
-
-    def history():
-        pick_list("history", read_lines(HIST_FILE, []))
-
-    def copy_url():
-        root.clipboard_clear()
-        root.clipboard_append(url_var.get())
-        set_status("copied")
-
-    def save_txt():
-        path = filedialog.asksaveasfilename(parent=root, defaultextension=".txt", initialfile="page.txt")
-        if path:
-            open(path, "w", encoding="utf-8").write(page.get("text") or "")
-            set_status("saved " + path)
-
     def find():
-        nonlocal find_pos
-        q = simpledialog.askstring(NAME, "find", parent=root)
+        nonlocal find_at
+        q = ask("find")
         if not q:
             return
         body.tag_remove("hit", "1.0", "end")
-        idx = body.search(q, find_pos, "end", nocase=True)
+        idx = body.search(q, find_at, "end", nocase=True) or body.search(q, "1.0", "end", nocase=True)
         if not idx:
-            idx = body.search(q, "1.0", "end", nocase=True)
-        if not idx:
-            set_status("no match")
+            say("no match")
             return
         end = "%s+%dc" % (idx, len(q))
         body.tag_add("hit", idx, end)
-        body.tag_config("hit", background="yellow")
+        body.tag_config("hit", background="#444400", foreground="#ffffff")
         body.see(idx)
-        find_pos = end
-        set_status("found")
+        find_at = end
 
-    def bigger():
-        size = FONT[1] + 1
-        body.configure(font=(FONT[0], size))
+    def pick(rows, title):
+        if not rows:
+            say("empty")
+            return
+        w = tk.Toplevel(root)
+        w.configure(bg=BG)
+        w.geometry("460x200+8+24")
+        w.title(title)
+        lb = tk.Listbox(w, height=8)
+        lb.pack(fill="both", expand=True)
+        for n, u in rows:
+            lb.insert("end", "%s  %s" % (n[:20], u[:36]))
 
-    def smaller():
-        size = max(6, FONT[1] - 1)
-        body.configure(font=(FONT[0], size))
+        def ok(_e=None):
+            i = lb.curselection()
+            if i:
+                go(rows[i[0]][1])
+                w.destroy()
 
-    def btn(parent, label, cmd):
-        tk.Button(parent, text=label, command=cmd, font=FONT, padx=2).pack(side="left")
+        lb.bind("<Double-1>", ok)
+        lb.bind("<Return>", ok)
+        lb.focus_set()
 
-    btn(top, "back", back)
-    btn(top, "home", home)
-    btn(top, "rel", reload_page)
-    entry = tk.Entry(top, textvariable=url_var, font=FONT)
-    entry.pack(side="left", fill="x", expand=True, padx=2)
+    def mark():
+        name = ask("name") or page.get("title")
+        if name:
+            write_kv(BM, read_kv(BM) + [(name, urlv.get())])
+            say("marked")
+
+    def pics():
+        nonlocal show_pics
+        show_pics = not show_pics
+        paint(page)
+
+    def copyu():
+        root.clipboard_clear()
+        root.clipboard_append(urlv.get())
+        say("copied")
+
+    def save():
+        path = filedialog.asksaveasfilename(parent=root, defaultextension=".txt")
+        if path:
+            open(path, "w", encoding="utf-8").write(page.get("text") or "")
+            say("saved")
+
+    def open_list(_e=None):
+        i = lst.curselection()
+        if i:
+            go(lst.urls[i[0]])
+
+    def key(e):
+        if e.widget == entry:
+            return
+        ch = e.char
+        if ch == "j":
+            body.yview_scroll(3, "units")
+        elif ch == "k":
+            body.yview_scroll(-3, "units")
+        elif ch == "g":
+            entry.focus_set()
+            entry.selection_range(0, "end")
+        elif ch == "b":
+            back()
+        elif ch == "/":
+            find()
+        elif ch == "s":
+            search()
+        elif ch == "q":
+            root.destroy()
+        elif ch.isdigit() and ch != "0":
+            n = int(ch) - 1
+            if n < len(getattr(lst, "urls", [])):
+                go(lst.urls[n])
+
+    b("<-", back)
+    entry = tk.Entry(bar, textvariable=urlv, relief="flat", insertbackground=FG)
+    entry.pack(side="left", fill="x", expand=True, padx=4, ipady=2)
     entry.bind("<Return>", lambda e: go())
-    btn(top, "go", go)
+    b("go", go)
+    b("find", find)
+    b("ddg", search)
+    b("*", mark)
+    b("marks", lambda: pick(read_kv(BM) or [("ex", HOME)], "marks"))
+    b("hist", lambda: pick(read_kv(HIST), "hist"))
+    b("pic", pics)
+    b("copy", copyu)
 
-    btn(mid, "find", find)
-    btn(mid, "search", search)
-    btn(mid, "mark", mark)
-    btn(mid, "marks", marks)
-    btn(mid, "hist", history)
-    btn(mid, "copy", copy_url)
-    btn(mid, "save", save_txt)
-    btn(mid, "a+", bigger)
-    btn(mid, "a-", smaller)
-    btn(mid, "quit", root.destroy)
-
-    links.bind("<Double-1>", follow)
-    links.bind("<Return>", follow)
+    lst.bind("<Double-1>", open_list)
+    lst.bind("<Return>", open_list)
     root.bind("<Alt-Left>", lambda e: back())
-    root.bind("<F5>", lambda e: reload_page())
-    root.bind("<Control-f>", lambda e: find())
+    root.bind("<F5>", lambda e: go(urlv.get(), push=False))
     root.bind("<Control-l>", lambda e: (entry.focus_set(), entry.selection_range(0, "end")))
-    root.bind("<Control-s>", lambda e: save_txt())
+    root.bind("<Control-f>", lambda e: find())
     root.bind("<Control-q>", lambda e: root.destroy())
+    root.bind("<Key>", key)
 
-    root.after(80, lambda: go(start, push=False))
+    root.after(50, lambda: go(start, push=False))
     root.mainloop()
     return 0
 
