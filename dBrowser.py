@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""dbrowser GUI — tiny Tk front end for SharkDeck (480x320).
-
-No WebKit. Fetches HTML and shows text + a link list.
-Needs python3-tk and a display ($DISPLAY).
-
-  dbrowser-gui
-  dbrowser-gui https://example.com
-"""
+"""dbrowser GUI — 480x320 Tk browser for SharkDeck. No WebKit."""
 
 import html
 import os
@@ -17,12 +10,15 @@ import urllib.request
 from html.parser import HTMLParser
 
 NAME = "dbrowser"
-GEOM = "480x304+0+0"
+GEOM = "480x320+0+0"
 FONT = ("TkFixedFont", 8)
-MAX_BODY = 400000
+MAX_BODY = 500000
 TIMEOUT = 15
+HOME = "https://example.com"
+SEARCH = "https://lite.duckduckgo.com/lite/?q=%s"
 BM_FILE = os.path.expanduser("~/.dbrowser.bookmarks")
-UA = "dbrowser/1.0 (SharkDeck GUI)"
+HIST_FILE = os.path.expanduser("~/.dbrowser.history")
+UA = "dbrowser/1.1 (SharkDeck GUI)"
 
 
 class PageParser(HTMLParser):
@@ -48,7 +44,7 @@ class PageParser(HTMLParser):
             return
         if tag == "title":
             self._intitle = True
-        if tag in ("p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4"):
+        if tag in ("p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "section"):
             self.chunks.append("\n")
         if tag == "li":
             self.chunks.append(" * ")
@@ -85,7 +81,10 @@ class PageParser(HTMLParser):
 
 def fetch_page(url):
     if "://" not in url:
-        url = "https://" + url
+        if " " in url or "." not in url:
+            url = SEARCH % urllib.parse.quote_plus(url)
+        else:
+            url = "https://" + url
     if url.startswith("file://"):
         path = urllib.parse.urlparse(url).path
         raw = open(path, "rb").read(MAX_BODY)
@@ -116,104 +115,132 @@ def parse_page(url):
     return {"url": final, "title": title, "text": text, "links": p.links}
 
 
-def read_bm():
-    if not os.path.exists(BM_FILE):
-        return [("example", "https://example.com"), ("docs", "https://sharkdeck.dev/docs")]
+def read_lines(path, fallback=None):
+    if not os.path.exists(path):
+        return list(fallback or [])
     rows = []
-    for line in open(BM_FILE, encoding="utf-8"):
+    for line in open(path, encoding="utf-8"):
         line = line.strip()
         if line and not line.startswith("#") and "|" in line:
-            n, u = line.split("|", 1)
-            rows.append((n.strip(), u.strip()))
+            a, b = line.split("|", 1)
+            rows.append((a.strip(), b.strip()))
     return rows
 
 
-def write_bm(rows):
-    with open(BM_FILE, "w", encoding="utf-8") as fh:
-        for n, u in rows:
-            fh.write("%s|%s\n" % (n, u))
+def write_lines(path, rows, cap=80):
+    with open(path, "w", encoding="utf-8") as fh:
+        for a, b in rows[:cap]:
+            fh.write("%s|%s\n" % (a, b))
 
 
 def main():
     try:
         import tkinter as tk
-        from tkinter import simpledialog
+        from tkinter import simpledialog, filedialog
         from tkinter.scrolledtext import ScrolledText
     except ImportError:
-        sys.stderr.write("need python3-tk:  apt install -y python3-tk\n")
-        return 2
-    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
-        sys.stderr.write("no DISPLAY. start X or use: dbrowser URL\n")
+        sys.stderr.write("apt install -y python3-tk\n")
         return 2
 
-    start = sys.argv[1] if len(sys.argv) > 1 else "https://example.com"
+    start = sys.argv[1] if len(sys.argv) > 1 else HOME
     hist = []
+    page = {"url": start, "title": NAME, "text": "", "links": []}
+    find_pos = "1.0"
 
     root = tk.Tk()
     root.title(NAME)
     root.geometry(GEOM)
-    root.resizable(True, True)
+    root.minsize(480, 280)
+
+    url_var = tk.StringVar(value=start)
+    status = tk.StringVar(value="ready")
 
     top = tk.Frame(root)
     top.pack(fill="x")
-    url_var = tk.StringVar(value=start)
+    mid = tk.Frame(root)
+    mid.pack(fill="x")
+    body = ScrolledText(root, font=FONT, wrap="word", height=9)
+    body.pack(fill="both", expand=True)
+    links = tk.Listbox(root, font=FONT, height=4)
+    links.pack(fill="x")
+    tk.Label(root, textvariable=status, font=FONT, anchor="w").pack(fill="x")
 
-    body = ScrolledText(root, font=FONT, wrap="word", height=10)
-    links = tk.Listbox(root, font=FONT, height=5)
+    def set_status(msg):
+        status.set(msg[:70])
+        root.update_idletasks()
 
-    def show(page):
-        url_var.set(page["url"])
-        root.title(clip := (page["title"][:40] or NAME))
+    def show(p):
+        nonlocal page, find_pos
+        page = p
+        url_var.set(p["url"])
+        root.title((p["title"] or NAME)[:48])
         body.delete("1.0", "end")
-        body.insert("1.0", page["text"] or "(empty)")
+        body.insert("1.0", p["text"] or "(empty)")
         links.delete(0, "end")
-        for text, href in page["links"][:80]:
-            links.insert("end", text[:60])
-        links.links = page["links"][:80]
+        links.links = p["links"][:100]
+        for i, (text, href) in enumerate(links.links, 1):
+            links.insert("end", "%d %s" % (i, text[:50]))
+        find_pos = "1.0"
+        set_status("%d links" % len(p["links"]))
         body.see("1.0")
 
+    def remember(url, title):
+        rows = read_lines(HIST_FILE, [])
+        rows = [(title or url, url)] + [r for r in rows if r[1] != url]
+        write_lines(HIST_FILE, rows, 60)
+
     def go(url=None, push=True):
-        url = (url or url_var.get()).strip()
+        url = (url if url is not None else url_var.get()).strip()
         if not url:
             return
-        if push and url_var.get():
-            hist.append(url_var.get())
+        if push and page.get("url"):
+            hist.append(page["url"])
+        set_status("loading...")
         root.config(cursor="watch")
-        root.update_idletasks()
-        page = parse_page(url)
+        root.update()
+        p = parse_page(url)
         root.config(cursor="")
-        show(page)
+        show(p)
+        remember(p["url"], p["title"])
 
     def back():
-        if not hist:
-            return
-        go(hist.pop(), push=False)
+        if hist:
+            go(hist.pop(), push=False)
 
-    def follow(_evt=None):
+    def home():
+        go(HOME)
+
+    def reload_page():
+        go(url_var.get(), push=False)
+
+    def search():
+        q = simpledialog.askstring(NAME, "search", parent=root)
+        if q:
+            go(SEARCH % urllib.parse.quote_plus(q))
+
+    def follow(_e=None):
         sel = links.curselection()
-        if not sel:
-            return
-        href = links.links[sel[0]][1]
-        go(href)
+        if sel:
+            go(links.links[sel[0]][1])
 
     def mark():
-        name = simpledialog.askstring(NAME, "bookmark name", parent=root)
+        name = simpledialog.askstring(NAME, "bookmark name", parent=root, initialvalue=page.get("title") or "")
         if name:
-            rows = read_bm()
+            rows = read_lines(BM_FILE, [("example", "https://example.com")])
             rows.append((name, url_var.get()))
-            write_bm(rows)
+            write_lines(BM_FILE, rows)
 
-    def marks():
-        rows = read_bm()
+    def pick_list(title, rows):
         if not rows:
+            set_status("empty")
             return
         win = tk.Toplevel(root)
-        win.title("marks")
-        win.geometry("420x200")
+        win.title(title)
+        win.geometry("460x220+0+20")
         lb = tk.Listbox(win, font=FONT)
         lb.pack(fill="both", expand=True)
         for n, u in rows:
-            lb.insert("end", "%s  %s" % (n, u))
+            lb.insert("end", "%s  %s" % (n[:24], u[:40]))
 
         def pick(_e=None):
             i = lb.curselection()
@@ -222,20 +249,79 @@ def main():
                 win.destroy()
 
         lb.bind("<Double-1>", pick)
-        tk.Button(win, text="open", command=pick).pack()
+        lb.bind("<Return>", pick)
+        tk.Button(win, text="open", command=pick, font=FONT).pack()
 
-    tk.Button(top, text="back", command=back, font=FONT).pack(side="left")
-    tk.Button(top, text="go", command=go, font=FONT).pack(side="right")
-    tk.Button(top, text="mark", command=mark, font=FONT).pack(side="right")
-    tk.Button(top, text="marks", command=marks, font=FONT).pack(side="right")
+    def marks():
+        pick_list("marks", read_lines(BM_FILE, [("example", HOME)]))
+
+    def history():
+        pick_list("history", read_lines(HIST_FILE, []))
+
+    def save_txt():
+        path = filedialog.asksaveasfilename(parent=root, defaultextension=".txt", initialfile="page.txt")
+        if path:
+            open(path, "w", encoding="utf-8").write(page.get("text") or "")
+            set_status("saved " + path)
+
+    def find():
+        nonlocal find_pos
+        q = simpledialog.askstring(NAME, "find", parent=root)
+        if not q:
+            return
+        body.tag_remove("hit", "1.0", "end")
+        idx = body.search(q, find_pos, "end", nocase=True)
+        if not idx:
+            idx = body.search(q, "1.0", "end", nocase=True)
+        if not idx:
+            set_status("no match")
+            return
+        end = "%s+%dc" % (idx, len(q))
+        body.tag_add("hit", idx, end)
+        body.tag_config("hit", background="yellow")
+        body.see(idx)
+        find_pos = end
+        set_status("found")
+
+    def bigger():
+        size = FONT[1] + 1
+        body.configure(font=(FONT[0], size))
+
+    def smaller():
+        size = max(6, FONT[1] - 1)
+        body.configure(font=(FONT[0], size))
+
+    def btn(parent, label, cmd):
+        tk.Button(parent, text=label, command=cmd, font=FONT, padx=2).pack(side="left")
+
+    btn(top, "back", back)
+    btn(top, "home", home)
+    btn(top, "rel", reload_page)
     entry = tk.Entry(top, textvariable=url_var, font=FONT)
     entry.pack(side="left", fill="x", expand=True, padx=2)
     entry.bind("<Return>", lambda e: go())
-    body.pack(fill="both", expand=True)
-    links.pack(fill="x")
-    links.bind("<Double-1>", follow)
+    btn(top, "go", go)
 
-    root.after(100, lambda: go(start, push=False))
+    btn(mid, "find", find)
+    btn(mid, "search", search)
+    btn(mid, "mark", mark)
+    btn(mid, "marks", marks)
+    btn(mid, "hist", history)
+    btn(mid, "save", save_txt)
+    btn(mid, "a+", bigger)
+    btn(mid, "a-", smaller)
+    btn(mid, "quit", root.destroy)
+
+    links.bind("<Double-1>", follow)
+    links.bind("<Return>", follow)
+    root.bind("<Alt-Left>", lambda e: back())
+    root.bind("<F5>", lambda e: reload_page())
+    root.bind("<Control-f>", lambda e: find())
+    root.bind("<Control-l>", lambda e: (entry.focus_set(), entry.selection_range(0, "end")))
+    root.bind("<Control-s>", lambda e: save_txt())
+    root.bind("<Control-q>", lambda e: root.destroy())
+
+    root.after(80, lambda: go(start, push=False))
     root.mainloop()
     return 0
 
