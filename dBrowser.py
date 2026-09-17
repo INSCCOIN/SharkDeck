@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""sBrowse — 48-col text browser for SharkDeck.
+"""dbrowser — 48-col text browser for SharkDeck.
 
 Stdlib only. No JS, no CSS layout.
 
-  sbrowse
-  sbrowse https://example.com
-  sbrowse file:///home/working/index.html
+  dbrowser
+  dbrowser https://example.com
+  dbrowser file:///home/working/index.html
 """
 
 import curses
@@ -18,12 +18,12 @@ import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 
-NAME = "sBrowse"
+NAME = "dbrowser"
 COLS_SOFT = 48
 MAX_BODY = 400000
 TIMEOUT = 15
-BM_FILE = os.path.expanduser("~/.sbrowse.bookmarks")
-UA = "sBrowse/1.0 (SharkDeck; +https://sharkdeck.dev/docs)"
+BM_FILE = os.path.expanduser("~/.dbrowser.bookmarks")
+UA = "dbrowser/1.0 (SharkDeck; +https://sharkdeck.dev/docs)"
 
 
 def clip(s, n):
