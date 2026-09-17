@@ -15,6 +15,7 @@ Data: ~/.serp/
 
 import argparse
 import curses
+import curses.textpad
 import json
 import os
 import sys
@@ -255,9 +256,6 @@ def cmd_value():
 
 # ---------------- curses ----------------
 
-PANES = ("stock", "parties", "journal", "orders")
-
-
 def clip(s, n):
     s = " ".join(str(s).split())
     if n <= 1:
@@ -265,219 +263,269 @@ def clip(s, n):
     return s if len(s) <= n else s[: n - 1] + "~"
 
 
-def put(stdscr, y, x, text, attr=0):
+def put(scr, y, x, text, attr=0):
     try:
-        h, w = stdscr.getmaxyx()
+        h, w = scr.getmaxyx()
         if y < 0 or x < 0 or y >= h or x >= w:
             return
         room = w - x - (1 if y == h - 1 else 0)
         if room <= 0:
             return
-        stdscr.addnstr(y, x, clip(text, room), room, attr)
+        scr.addnstr(y, x, clip(str(text), room), room, attr)
     except curses.error:
         pass
 
 
-class UI:
-    def __init__(self):
-        ensure()
-        self.pane = 0
-        self.cur = 0
-        self.msg = ROOT
+class Pane:
+    def __init__(self, kind):
+        self.kind = kind
+        self.cursor = 0
+        self.scroll = 0
         self.rows = []
 
     def reload(self):
-        name = PANES[self.pane]
-        if name == "stock":
+        self.rows = []
+        if self.kind == "stock":
             st = stock_map()
             items = load_json(ITEMS)
-            skus = sorted(set(list(items) + list(st)))
-            self.rows = []
-            for sku in skus:
-                it = items.get(sku) or {"name": sku, "price": 0, "min": 0}
+            for sku in sorted(set(list(items) + list(st))):
+                it = items.get(sku) or {"name": sku, "price": 0}
                 self.rows.append({
-                    "key": sku,
-                    "line": "%-8s %5d %7s  %s" % (
-                        sku[:8], st.get(sku, 0), money(it.get("price") or 0), it.get("name", "")[:20],
-                    ),
-                    "detail": "sku %s\n%s\nqty %d\nprice %s\ncost %s\nmin %s" % (
-                        sku, it.get("name"), st.get(sku, 0),
-                        money(it.get("price") or 0), money(it.get("cost") or 0), it.get("min") or 0,
+                    "sku": sku,
+                    "line": "%-8s %4d %7s %s" % (
+                        sku[:8], st.get(sku, 0), money(it.get("price") or 0),
+                        (it.get("name") or "")[:14],
                     ),
                 })
-        elif name == "parties":
-            parties = load_json(PARTIES)
-            self.rows = []
-            for n, p in sorted(parties.items()):
-                self.rows.append({
-                    "key": n,
-                    "line": "%-16s %s" % (n[:16], p.get("kind")),
-                    "detail": "%s\n%s\n%s" % (n, p.get("kind"), p.get("since", "")),
-                })
-        elif name == "journal":
-            self.rows = []
+        elif self.kind == "parties":
+            for n, p in sorted(load_json(PARTIES).items()):
+                self.rows.append({"sku": n, "line": "%-14s %s" % (n[:14], p.get("kind"))})
+        elif self.kind == "journal":
             for r in reversed(read_j()[-80:]):
                 extra = r.get("sku") or r.get("party") or ""
                 self.rows.append({
-                    "key": r.get("id"),
-                    "line": "%s %-4s %s %s" % (str(r.get("ts", ""))[5:16], r.get("type"), extra, r.get("qty", "")),
-                    "detail": json.dumps(r, indent=2),
+                    "sku": extra,
+                    "line": "%s %-4s %s %s" % (
+                        str(r.get("ts", ""))[5:16], r.get("type"), extra[:8], r.get("qty", ""),
+                    ),
                 })
         else:
-            self.rows = []
             for r in reversed([x for x in read_j() if x.get("type") == "so"][-40:]):
                 self.rows.append({
-                    "key": r.get("id"),
-                    "line": "%s %-10s %s x%s %s" % (
-                        str(r.get("id", ""))[-6:], r.get("party", "")[:10],
+                    "sku": r.get("sku"),
+                    "line": "%s %-8s %sx%s %s" % (
+                        str(r.get("id", ""))[-4:], str(r.get("party", ""))[:8],
                         r.get("sku"), r.get("qty"), money(r.get("total") or 0),
                     ),
-                    "detail": json.dumps(r, indent=2),
                 })
-        if self.cur >= len(self.rows):
-            self.cur = max(0, len(self.rows) - 1)
+        if self.cursor >= len(self.rows):
+            self.cursor = max(0, len(self.rows) - 1)
 
-    def prompt(self, stdscr, title):
-        curses.echo()
-        curses.curs_set(1)
-        h, w = stdscr.getmaxyx()
-        put(stdscr, h - 1, 0, " " * max(0, w - 1))
-        put(stdscr, h - 1, 0, title + " ")
-        stdscr.refresh()
+    def move(self, d):
+        if not self.rows:
+            return
+        self.cursor = max(0, min(len(self.rows) - 1, self.cursor + d))
+
+    def current(self):
+        if not self.rows:
+            return {}
+        return self.rows[self.cursor]
+
+
+class App:
+    KINDS = ("stock", "journal", "parties", "orders")
+
+    def __init__(self, stdscr):
+        self.scr = stdscr
+        self.panes = [Pane("stock"), Pane("journal")]
+        self.active = 0
+        self.msg = "sERP"
+        self.err = False
+
+    @property
+    def pane(self):
+        return self.panes[self.active]
+
+    def colors(self):
+        if not curses.has_colors():
+            return
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_RED)
+
+    def reload(self):
+        for p in self.panes:
+            p.reload()
+
+    def say(self, t, err=False):
+        self.msg = t
+        self.err = err
+
+    def prompt(self, title, default=""):
+        h, w = self.scr.getmaxyx()
+        ph, pw = 5, min(w - 2, 48)
+        y, x = max(0, h // 2 - 2), max(0, (w - pw) // 2)
+        win = curses.newwin(ph, pw, y, x)
         try:
-            raw = stdscr.getstr(h - 1, min(w - 2, len(title) + 1), max(8, w - 12))
-            text = raw.decode("utf-8", "replace").strip()
-        except Exception:
-            text = ""
-        curses.noecho()
+            win.bkgd(" ", curses.color_pair(4))
+        except curses.error:
+            pass
+        win.box()
+        put(win, 1, 2, title)
+        win.refresh()
+        sub = win.derwin(1, max(8, pw - 4), 3, 2)
+        try:
+            sub.addstr(0, 0, default[: pw - 4])
+        except curses.error:
+            pass
+        curses.curs_set(1)
+        try:
+            raw = curses.textpad.Textbox(sub).edit().strip()
+        except KeyboardInterrupt:
+            raw = ""
         curses.curs_set(0)
-        return text
+        return raw or None
 
-    def draw(self, stdscr):
-        h, w = stdscr.getmaxyx()
-        mid = max(18, w * 3 // 5)
-        stdscr.erase()
-        tabs = " ".join(
-            ("[%s]" % p.upper() if i == self.pane else p) for i, p in enumerate(PANES)
-        )
-        put(stdscr, 0, 0, (NAME + "  " + tabs).ljust(w), curses.A_REVERSE)
-        left_h = h - 2
-        top = 0
-        if self.cur >= top + left_h:
-            top = self.cur - left_h + 1
-        for i in range(left_h):
-            idx = top + i
-            if idx >= len(self.rows):
-                break
-            attr = curses.A_REVERSE if idx == self.cur else curses.A_NORMAL
-            put(stdscr, 1 + i, 0, self.rows[idx]["line"].ljust(mid - 1), attr)
-        det = ""
-        if self.rows:
-            det = self.rows[self.cur]["detail"]
-        dy = 1
-        for line in det.splitlines():
-            if dy >= h - 1:
-                break
-            put(stdscr, dy, mid, line)
-            dy += 1
-        helpbar = "tab pane  a add  r recv  s ship  o sale  q"
-        put(stdscr, h - 1, 0, (self.msg + " | " + helpbar).ljust(w), curses.A_REVERSE)
-        stdscr.refresh()
+    def cycle_kind(self, pane):
+        i = self.KINDS.index(pane.kind) if pane.kind in self.KINDS else 0
+        pane.kind = self.KINDS[(i + 1) % len(self.KINDS)]
+        pane.cursor = 0
+        pane.reload()
 
-    def add_item(self, stdscr):
-        sku = self.prompt(stdscr, "sku")
+    def draw(self):
+        scr = self.scr
+        h, w = scr.getmaxyx()
+        mid = w // 2
+        list_h = max(1, h - 4)
+        scr.erase()
+        put(scr, 0, 0, ("sERP  " + ROOT).ljust(w), curses.A_REVERSE)
+        for pi, pane in enumerate(self.panes):
+            x0 = 0 if pi == 0 else mid + 1
+            pw = mid if pi == 0 else w - mid - 1
+            title = ("[%s]" if pi == self.active else " %s ") % pane.kind.upper()
+            put(scr, 1, x0, title.ljust(max(0, pw)), curses.color_pair(4) if pi == self.active else curses.A_NORMAL)
+            vis = list_h
+            if pane.cursor < pane.scroll:
+                pane.scroll = pane.cursor
+            if pane.cursor >= pane.scroll + vis:
+                pane.scroll = pane.cursor - vis + 1
+            for i in range(vis):
+                idx = pane.scroll + i
+                if idx >= len(pane.rows):
+                    break
+                attr = curses.A_NORMAL
+                if idx == pane.cursor and pi == self.active:
+                    attr = curses.color_pair(2) | curses.A_BOLD
+                put(scr, 2 + i, x0, pane.rows[idx]["line"].ljust(pw), attr)
+        if 0 < mid < w:
+            for y in range(1, list_h + 2):
+                try:
+                    scr.addch(y, mid, curses.ACS_VLINE)
+                except curses.error:
+                    pass
+        cur = self.pane.current()
+        put(scr, h - 3, 0, ("sel " + (cur.get("sku") or "-") + "  tab pane  t type").ljust(w), curses.color_pair(4))
+        put(scr, h - 2, 0, (self.msg or NAME).ljust(w), curses.color_pair(5) if self.err else curses.color_pair(4))
+        put(scr, h - 1, 0, "F2 item  F3 party  F5 recv  F6 ship  F7 sale  F10 quit", curses.A_REVERSE)
+        scr.refresh()
+
+    def add_item(self):
+        sku = self.prompt("SKU")
         if not sku:
             return
-        name = self.prompt(stdscr, "name") or sku
-        price = self.prompt(stdscr, "price") or "0"
+        name = self.prompt("name", sku) or sku
+        price = self.prompt("price", "0") or "0"
         item_put(sku, name=name, price=parse_money(price))
-        self.msg = "item " + sku
+        self.say("item " + sku)
 
-    def add_party(self, stdscr):
-        name = self.prompt(stdscr, "party")
+    def add_party(self):
+        name = self.prompt("party")
         if not name:
             return
-        kind = self.prompt(stdscr, "customer/vendor") or "customer"
+        kind = self.prompt("customer or vendor", "customer") or "customer"
         party_put(name, kind if kind in ("customer", "vendor") else "customer")
-        self.msg = "party " + name
+        self.say("party " + name)
 
-    def do_recv(self, stdscr):
-        sku = self.prompt(stdscr, "recv sku")
+    def do_recv(self):
+        sku = self.prompt("recv SKU", self.pane.current().get("sku") or "")
         if not sku:
             return
-        qty = self.prompt(stdscr, "qty")
+        qty = self.prompt("qty")
         if not qty:
             return
         cmd_recv(sku, qty)
-        self.msg = "recv %s x%s" % (sku, qty)
+        self.say("recv %s x%s" % (sku, qty))
 
-    def do_ship(self, stdscr):
-        sku = self.prompt(stdscr, "ship sku")
+    def do_ship(self):
+        sku = self.prompt("ship SKU", self.pane.current().get("sku") or "")
         if not sku:
             return
-        qty = self.prompt(stdscr, "qty")
+        qty = self.prompt("qty")
         if not qty:
             return
         rc = cmd_ship(sku, qty)
-        self.msg = "shipped" if rc == 0 else "not enough"
+        self.say("shipped" if rc == 0 else "not enough", err=rc != 0)
 
-    def do_so(self, stdscr):
-        party = self.prompt(stdscr, "customer")
-        sku = self.prompt(stdscr, "sku")
-        qty = self.prompt(stdscr, "qty")
+    def do_so(self):
+        party = self.prompt("customer")
+        sku = self.prompt("SKU", self.pane.current().get("sku") or "")
+        qty = self.prompt("qty")
         if party and sku and qty:
             rc = cmd_so(party, sku, qty)
-            self.msg = "sale ok" if rc == 0 else "sale fail"
+            self.say("sale ok" if rc == 0 else "sale fail", err=rc != 0)
 
-    def run(self, stdscr):
+    def run(self):
         curses.curs_set(0)
-        curses.use_default_colors()
+        self.colors()
         self.reload()
         while True:
-            self.draw(stdscr)
-            k = stdscr.getch()
-            if k in (ord("q"), 27):
+            self.draw()
+            k = self.scr.getch()
+            self.err = False
+            if k in (ord("q"), curses.KEY_F10, 27):
                 break
             elif k == 9:
-                self.pane = (self.pane + 1) % len(PANES)
-                self.cur = 0
-                self.reload()
-            elif k == curses.KEY_BTAB:
-                self.pane = (self.pane - 1) % len(PANES)
-                self.cur = 0
-                self.reload()
-            elif k == curses.KEY_DOWN:
-                self.cur = min(len(self.rows) - 1, self.cur + 1) if self.rows else 0
+                self.active = 1 - self.active
             elif k == curses.KEY_UP:
-                self.cur = max(0, self.cur - 1)
-            elif k == ord("a"):
-                if PANES[self.pane] == "parties":
-                    self.add_party(stdscr)
-                else:
-                    self.add_item(stdscr)
+                self.pane.move(-1)
+            elif k == curses.KEY_DOWN:
+                self.pane.move(1)
+            elif k == curses.KEY_PPAGE:
+                self.pane.move(-8)
+            elif k == curses.KEY_NPAGE:
+                self.pane.move(8)
+            elif k in (ord("t"), ord("T")):
+                self.cycle_kind(self.pane)
+            elif k == curses.KEY_F2:
+                self.add_item()
                 self.reload()
-            elif k == ord("r"):
-                self.do_recv(stdscr)
+            elif k == curses.KEY_F3:
+                self.add_party()
                 self.reload()
-            elif k == ord("s"):
-                self.do_ship(stdscr)
+            elif k == curses.KEY_F5:
+                self.do_recv()
                 self.reload()
-            elif k == ord("o"):
-                self.do_so(stdscr)
+            elif k == curses.KEY_F6:
+                self.do_ship()
                 self.reload()
-            elif k == ord("l"):
-                self.pane = 2
-                self.cur = 0
+            elif k == curses.KEY_F7:
+                self.do_so()
                 self.reload()
+            elif k == curses.KEY_F1:
+                self.say("tab switch  t change list  F5 recv F6 ship F7 sale")
 
 
 def ui():
     if not sys.stdout.isatty():
-        print("serp UI needs a tty")
+        print("sERP UI needs a tty")
         return 2
     ensure()
-    curses.wrapper(lambda s: UI().run(s))
+    curses.wrapper(lambda s: App(s).run())
     return 0
+
 
 
 def main(argv=None):
