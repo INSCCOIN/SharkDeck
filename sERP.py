@@ -541,14 +541,13 @@ class App:
         if not curses.has_colors():
             return
         curses.start_color()
-        curses.use_default_colors()
-        curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)
-        curses.init_pair(3, curses.COLOR_YELLOW, -1)
-        curses.init_pair(4, curses.COLOR_WHITE, curses.COLOR_BLUE)
-        curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_RED)
-        curses.init_pair(6, curses.COLOR_RED, -1)
-        curses.init_pair(7, curses.COLOR_GREEN, -1)
-        curses.init_pair(8, curses.COLOR_CYAN, -1)
+        curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_GREEN)
+        curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        try:
+            self.scr.bkgd(" ", curses.color_pair(1))
+        except curses.error:
+            pass
 
     def reload(self):
         self.left.reload()
@@ -569,7 +568,7 @@ class App:
         y, x = max(0, h // 2 - 2), max(0, (w - pw) // 2)
         win = curses.newwin(ph, pw, y, x)
         try:
-            win.bkgd(" ", curses.color_pair(4))
+            win.bkgd(" ", curses.color_pair(2))
         except curses.error:
             pass
         win.box()
@@ -600,8 +599,8 @@ class App:
         qty, costs = stock_from_journal()
         items = load_json(ITEMS)
         val = sum(costs.get(s, int((items.get(s) or {}).get("cost") or 0)) * max(q, 0) for s, q in qty.items())
-        return "sERP  td %s  wk %s  stk %s  %s" % (
-            money(dt), money(wt), money(val), datetime.now().strftime("%H:%M"),
+        return "SERP  %s  TD %s  WK %s  %s" % (
+            money(val), money(dt), money(wt), datetime.now().strftime("%H:%M"),
         )
 
     def detail(self):
@@ -626,15 +625,15 @@ class App:
         scr = self.scr
         h, w = scr.getmaxyx()
         mid = max(16, w // 2)
-        list_h = max(1, h - 5)
+        list_h = max(1, h - 4)
         scr.erase()
-        put(scr, 0, 0, self.header().ljust(w), curses.color_pair(4) | curses.A_BOLD)
+        put(scr, 0, 0, self.header().ljust(w), curses.color_pair(2))
         for pi, pane in enumerate((self.left, self.right)):
             x0 = 0 if pi == 0 else mid + 1
             pw = mid if pi == 0 else max(1, w - mid - 1)
             title = "%s %d%s" % (pane.kind.upper(), len(pane.rows),
-                                 " /" + pane.filter if pane.filter else "")
-            bar = curses.color_pair(2) if pi == self.active else curses.color_pair(4)
+                                 "/" + pane.filter if pane.filter else "")
+            bar = curses.color_pair(2) if pi == self.active else curses.A_NORMAL
             put(scr, 1, x0, title.ljust(pw), bar)
             vis = max(1, list_h - 1)
             if pane.cursor < pane.scroll:
@@ -642,29 +641,27 @@ class App:
             if pane.cursor >= pane.scroll + vis:
                 pane.scroll = pane.cursor - vis + 1
             if not pane.rows:
-                put(scr, 2, x0, "(empty)", curses.color_pair(3))
+                put(scr, 2, x0, "--")
             for i in range(vis):
                 idx = pane.scroll + i
                 if idx >= len(pane.rows):
                     break
                 row = pane.rows[idx]
-                attr = curses.A_NORMAL
+                attr = curses.color_pair(1)
                 if row.get("low"):
-                    attr = curses.color_pair(6)
-                if row.get("kind") == "so":
-                    attr = curses.color_pair(7)
+                    attr = curses.A_BOLD
                 if idx == pane.cursor and pi == self.active:
-                    attr = curses.color_pair(2) | curses.A_BOLD
+                    attr = curses.color_pair(2)
                 put(scr, 2 + i, x0, row["line"].ljust(pw), attr)
         if 0 < mid < w:
             for y in range(1, list_h + 2):
                 try:
-                    scr.addch(y, mid, curses.ACS_VLINE)
+                    scr.addch(y, mid, curses.ACS_VLINE, curses.color_pair(1))
                 except curses.error:
                     pass
-        put(scr, h - 3, 0, self.detail().ljust(w), curses.color_pair(4))
-        put(scr, h - 2, 0, (self.msg or NAME).ljust(w), curses.color_pair(5) if self.err else curses.color_pair(8))
-        put(scr, h - 1, 0, "1? 2Itm 3Pty 4Ed 5Scan 6Ship 7Sale 8Adj 9Buy Uundo 10", curses.A_REVERSE)
+        put(scr, h - 2, 0, (self.msg or self.detail()).ljust(w),
+            curses.color_pair(2) if self.err else curses.A_NORMAL)
+        put(scr, h - 1, 0, "1? 2Item 3Party 4Edit 5In 6Out 7Sale 8Adj 9Buy 0Quit", curses.color_pair(2))
         scr.refresh()
 
     def help_screen(self):
