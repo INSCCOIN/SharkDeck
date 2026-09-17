@@ -254,6 +254,53 @@ def cmd_value():
     print("on-hand cost", money(total))
 
 
+def cmd_adj(sku, qty):
+    if not item_get(sku):
+        item_put(sku, name=sku)
+    q = int(qty)
+    append_j({"type": "adj", "sku": sku, "qty": q})
+    print("adj %s %+d  on-hand %d" % (sku, q, stock_map().get(sku, 0)))
+
+
+def cmd_po(vendor, sku, qty, cost=None):
+    parties = load_json(PARTIES)
+    if vendor not in parties:
+        party_put(vendor, "vendor")
+    if not item_get(sku):
+        item_put(sku, name=sku)
+    if cost is not None:
+        item_put(sku, cost=parse_money(cost))
+    cmd_recv(sku, qty, cost)
+    rec = append_j({
+        "type": "po",
+        "party": vendor,
+        "sku": sku,
+        "qty": int(qty),
+        "cost": parse_money(cost) if cost is not None else int((item_get(sku) or {}).get("cost") or 0),
+    })
+    print("PO %s  %s x%s" % (rec["id"][-6:], sku, qty))
+
+
+def cmd_sales():
+    total = 0
+    n = 0
+    for r in read_j():
+        if r.get("type") == "so":
+            total += int(r.get("total") or 0)
+            n += 1
+    print("%d sales  %s" % (n, money(total)))
+
+
+def party_sales(name):
+    t = 0
+    n = 0
+    for r in read_j():
+        if r.get("type") == "so" and r.get("party") == name:
+            t += int(r.get("total") or 0)
+            n += 1
+    return n, t
+
+
 # ---------------- curses ----------------
 
 def clip(s, n):
@@ -282,42 +329,50 @@ class Pane:
         self.cursor = 0
         self.scroll = 0
         self.rows = []
+        self.filter = ""
 
     def reload(self):
         self.rows = []
+        fl = self.filter.lower()
         if self.kind == "stock":
             st = stock_map()
             items = load_json(ITEMS)
             for sku in sorted(set(list(items) + list(st))):
-                it = items.get(sku) or {"name": sku, "price": 0}
-                self.rows.append({
-                    "sku": sku,
-                    "line": "%-8s %4d %7s %s" % (
-                        sku[:8], st.get(sku, 0), money(it.get("price") or 0),
-                        (it.get("name") or "")[:14],
-                    ),
-                })
+                it = items.get(sku) or {"name": sku, "price": 0, "min": 0, "bin": ""}
+                q = st.get(sku, 0)
+                flag = "!" if q <= int(it.get("min") or 0) else " "
+                line = "%s%-7s %4d %7s %s" % (
+                    flag, sku[:7], q, money(it.get("price") or 0), (it.get("name") or "")[:12],
+                )
+                blob = (sku + " " + str(it.get("name")) + " " + str(it.get("bin"))).lower()
+                if fl and fl not in blob:
+                    continue
+                self.rows.append({"sku": sku, "line": line, "kind": "item"})
         elif self.kind == "parties":
             for n, p in sorted(load_json(PARTIES).items()):
-                self.rows.append({"sku": n, "line": "%-14s %s" % (n[:14], p.get("kind"))})
+                if fl and fl not in n.lower() and fl not in p.get("kind", ""):
+                    continue
+                ns, tot = party_sales(n)
+                extra = money(tot) if p.get("kind") == "customer" else p.get("kind")
+                self.rows.append({"sku": n, "line": "%-12s %s" % (n[:12], extra), "kind": "party"})
         elif self.kind == "journal":
-            for r in reversed(read_j()[-80:]):
+            for r in reversed(read_j()[-120:]):
                 extra = r.get("sku") or r.get("party") or ""
-                self.rows.append({
-                    "sku": extra,
-                    "line": "%s %-4s %s %s" % (
-                        str(r.get("ts", ""))[5:16], r.get("type"), extra[:8], r.get("qty", ""),
-                    ),
-                })
+                line = "%s %-4s %s %s" % (
+                    str(r.get("ts", ""))[5:16], r.get("type"), extra[:8], r.get("qty", ""),
+                )
+                if fl and fl not in line.lower():
+                    continue
+                self.rows.append({"sku": extra, "line": line, "kind": "j"})
         else:
-            for r in reversed([x for x in read_j() if x.get("type") == "so"][-40:]):
-                self.rows.append({
-                    "sku": r.get("sku"),
-                    "line": "%s %-8s %sx%s %s" % (
-                        str(r.get("id", ""))[-4:], str(r.get("party", ""))[:8],
-                        r.get("sku"), r.get("qty"), money(r.get("total") or 0),
-                    ),
-                })
+            for r in reversed([x for x in read_j() if x.get("type") in ("so", "po")][-60:]):
+                line = "%s %-2s %-8s %sx%s" % (
+                    str(r.get("id", ""))[-4:], r.get("type"), str(r.get("party", ""))[:8],
+                    r.get("sku"), r.get("qty"),
+                )
+                if fl and fl not in line.lower():
+                    continue
+                self.rows.append({"sku": r.get("sku"), "line": line, "kind": "ord"})
         if self.cursor >= len(self.rows):
             self.cursor = max(0, len(self.rows) - 1)
 
@@ -427,10 +482,47 @@ class App:
                 except curses.error:
                     pass
         cur = self.pane.current()
-        put(scr, h - 3, 0, ("sel " + (cur.get("sku") or "-") + "  tab pane  t type").ljust(w), curses.color_pair(4))
+        fl = (" /" + self.pane.filter) if self.pane.filter else ""
+        put(scr, h - 3, 0, ("sel " + (cur.get("sku") or "-") + fl + "  tab  t list").ljust(w), curses.color_pair(4))
         put(scr, h - 2, 0, (self.msg or NAME).ljust(w), curses.color_pair(5) if self.err else curses.color_pair(4))
-        put(scr, h - 1, 0, "F2 item  F3 party  F5 recv  F6 ship  F7 sale  F10 quit", curses.A_REVERSE)
+        put(scr, h - 1, 0, "F1? F2 itm F3 pty F4 ed F5 in F6 out F7 so F8 adj F9 po F10", curses.A_REVERSE)
         scr.refresh()
+
+    def help_screen(self):
+        lines = [
+            "sERP  commander keys",
+            "Tab        other pane",
+            "t          stock / journal / parties / orders",
+            "/          filter this pane",
+            "F1         this help",
+            "F2         new item",
+            "F3         new customer/vendor",
+            "F4         edit item (name price min bin)",
+            "F5         receive stock",
+            "F6         ship stock",
+            "F7         sale (customer + sku + qty)",
+            "F8         adjust qty (+/-)",
+            "F9         purchase from vendor",
+            "v          on-hand value",
+            "l          low stock",
+            "F10 / q    quit",
+            "",
+            "! in stock list = at or below min",
+        ]
+        h, w = self.scr.getmaxyx()
+        top = 0
+        while True:
+            self.scr.erase()
+            put(self.scr, 0, 0, "help".ljust(w), curses.A_REVERSE)
+            for i in range(1, h - 1):
+                li = top + i - 1
+                if li < len(lines):
+                    put(self.scr, i, 0, lines[li])
+            put(self.scr, h - 1, 0, "q back", curses.A_REVERSE)
+            self.scr.refresh()
+            k = self.scr.getch()
+            if k in (ord("q"), 27, curses.KEY_F10, curses.KEY_F1):
+                break
 
     def add_item(self):
         sku = self.prompt("SKU")
@@ -438,8 +530,22 @@ class App:
             return
         name = self.prompt("name", sku) or sku
         price = self.prompt("price", "0") or "0"
-        item_put(sku, name=name, price=parse_money(price))
+        mn = self.prompt("min qty", "0") or "0"
+        bin_ = self.prompt("bin", "") or ""
+        item_put(sku, name=name, price=parse_money(price), min=int(mn or 0), bin=bin_)
         self.say("item " + sku)
+
+    def edit_item(self):
+        sku = self.pane.current().get("sku") or self.prompt("edit SKU")
+        if not sku:
+            return
+        it = item_get(sku) or {"name": sku, "price": 0, "min": 0, "bin": ""}
+        name = self.prompt("name", str(it.get("name") or sku)) or sku
+        price = self.prompt("price", money(it.get("price") or 0)) or "0"
+        mn = self.prompt("min", str(it.get("min") or 0)) or "0"
+        bin_ = self.prompt("bin", str(it.get("bin") or "")) or ""
+        item_put(sku, name=name, price=parse_money(price), min=int(mn or 0), bin=bin_)
+        self.say("edited " + sku)
 
     def add_party(self):
         name = self.prompt("party")
@@ -477,6 +583,32 @@ class App:
             rc = cmd_so(party, sku, qty)
             self.say("sale ok" if rc == 0 else "sale fail", err=rc != 0)
 
+    def do_adj(self):
+        sku = self.prompt("adj SKU", self.pane.current().get("sku") or "")
+        if not sku:
+            return
+        qty = self.prompt("delta (+/-)")
+        if not qty:
+            return
+        cmd_adj(sku, qty)
+        self.say("adj %s %+s" % (sku, qty))
+
+    def do_po(self):
+        vendor = self.prompt("vendor")
+        sku = self.prompt("SKU", self.pane.current().get("sku") or "")
+        qty = self.prompt("qty")
+        cost = self.prompt("unit cost", "")
+        if vendor and sku and qty:
+            cmd_po(vendor, sku, qty, cost or None)
+            self.say("PO " + vendor)
+
+    def set_filter(self):
+        raw = self.prompt("filter (empty clears)", self.pane.filter)
+        self.pane.filter = raw or ""
+        self.pane.cursor = 0
+        self.pane.reload()
+        self.say("filter " + (self.pane.filter or "off"))
+
     def run(self):
         curses.curs_set(0)
         self.colors()
@@ -499,11 +631,32 @@ class App:
                 self.pane.move(8)
             elif k in (ord("t"), ord("T")):
                 self.cycle_kind(self.pane)
+            elif k == ord("/"):
+                self.set_filter()
+            elif k in (ord("v"), ord("V")):
+                st = stock_map()
+                items = load_json(ITEMS)
+                total = sum(int((items.get(s) or {}).get("cost") or 0) * max(q, 0) for s, q in st.items())
+                self.say("on-hand cost " + money(total))
+            elif k in (ord("l"), ord("L")):
+                self.pane.kind = "stock"
+                lows = []
+                st = stock_map()
+                for sku, it in load_json(ITEMS).items():
+                    if st.get(sku, 0) <= int(it.get("min") or 0):
+                        lows.append(sku)
+                self.say("low: " + (", ".join(lows) if lows else "none"))
+                self.pane.reload()
+            elif k in (curses.KEY_F1, ord("?")):
+                self.help_screen()
             elif k == curses.KEY_F2:
                 self.add_item()
                 self.reload()
             elif k == curses.KEY_F3:
                 self.add_party()
+                self.reload()
+            elif k == curses.KEY_F4:
+                self.edit_item()
                 self.reload()
             elif k == curses.KEY_F5:
                 self.do_recv()
@@ -514,8 +667,12 @@ class App:
             elif k == curses.KEY_F7:
                 self.do_so()
                 self.reload()
-            elif k == curses.KEY_F1:
-                self.say("tab switch  t change list  F5 recv F6 ship F7 sale")
+            elif k == curses.KEY_F8:
+                self.do_adj()
+                self.reload()
+            elif k == curses.KEY_F9:
+                self.do_po()
+                self.reload()
 
 
 def ui():
@@ -537,6 +694,7 @@ def main(argv=None):
     sub.add_parser("low")
     sub.add_parser("value")
     sub.add_parser("log")
+    sub.add_parser("sales")
     a = sub.add_parser("item")
     a.add_argument("op", choices=("add", "ls"))
     a.add_argument("sku", nargs="?")
@@ -557,6 +715,14 @@ def main(argv=None):
     e.add_argument("party")
     e.add_argument("sku")
     e.add_argument("qty")
+    f = sub.add_parser("adj")
+    f.add_argument("sku")
+    f.add_argument("qty")
+    g = sub.add_parser("po")
+    g.add_argument("vendor")
+    g.add_argument("sku")
+    g.add_argument("qty")
+    g.add_argument("cost", nargs="?")
     args = p.parse_args(argv)
     if args.cmd in (None, "ui"):
         return ui()
@@ -568,6 +734,8 @@ def main(argv=None):
         cmd_value()
     elif args.cmd == "log":
         cmd_log()
+    elif args.cmd == "sales":
+        cmd_sales()
     elif args.cmd == "item":
         if args.op == "ls" or not args.sku:
             cmd_item_ls()
@@ -584,6 +752,10 @@ def main(argv=None):
         return cmd_ship(args.sku, args.qty) or 0
     elif args.cmd == "so":
         return cmd_so(args.party, args.sku, args.qty) or 0
+    elif args.cmd == "adj":
+        cmd_adj(args.sku, args.qty)
+    elif args.cmd == "po":
+        cmd_po(args.vendor, args.sku, args.qty, args.cost)
     return 0
 
 
