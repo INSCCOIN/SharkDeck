@@ -120,6 +120,8 @@ class Doc(HTMLParser):
         self.cur = []
         self.links = []
         self.images = []
+        self.forms = []
+        self._form = None
         self.region = "body"
 
     def _flush(self, kind="p"):
@@ -137,6 +139,24 @@ class Doc(HTMLParser):
             return
         if self.skip:
             return
+        if tag == "form":
+            self._form = {
+                "action": urllib.parse.urljoin(self.base, ad.get("action") or self.base),
+                "method": (ad.get("method") or "get").lower(),
+                "fields": [],
+            }
+        elif tag in ("input", "textarea") and self._form is not None:
+            typ = (ad.get("type") or "text").lower()
+            name = ad.get("name") or ""
+            if typ in ("hidden", "text", "search", "q", "email", "url", "") or tag == "textarea":
+                self._form["fields"].append({
+                    "name": name,
+                    "type": typ if typ != "hidden" else "hidden",
+                    "value": ad.get("value") or "",
+                    "placeholder": ad.get("placeholder") or ad.get("aria-label") or name,
+                })
+            elif typ == "submit" and name:
+                self._form["fields"].append({"name": name, "type": "hidden", "value": ad.get("value") or "1", "placeholder": ""})
         if self.reader and tag in self.CHROME:
             self.chrome += 1
             return
@@ -181,6 +201,10 @@ class Doc(HTMLParser):
             return
         if self.skip:
             return
+        if tag == "form" and self._form is not None:
+            if any(f["name"] for f in self._form["fields"]):
+                self.forms.append(self._form)
+            self._form = None
         if self.reader and tag in self.CHROME and self.chrome:
             self.chrome -= 1
             return
@@ -283,12 +307,12 @@ def load_page(url, reader=True):
     try:
         final, raw, ctype, cs = http_get(url)
     except Exception as exc:
-        return {"url": url, "title": "error", "text": str(exc), "links": [], "images": []}
+        return {"url": url, "title": "error", "text": str(exc), "links": [], "images": [], "forms": []}
     text = decode_body(raw, cs)
     if "html" not in (ctype or "").lower() and not text.lstrip().lower().startswith("<!"):
         return {
             "url": final, "title": final, "text": wrap(text),
-            "links": [], "images": [],
+            "links": [], "images": [], "forms": [],
         }
     doc = Doc(final, reader=reader)
     try:
@@ -302,6 +326,7 @@ def load_page(url, reader=True):
         "text": doc.finish(reader=reader),
         "links": doc.links,
         "images": list(dict.fromkeys(doc.images))[:8],
+        "forms": doc.forms,
     }
 
 
@@ -322,6 +347,83 @@ def write_kv(path, rows, cap=50):
     with open(path, "w", encoding="utf-8") as fh:
         for a, b in rows[:cap]:
             fh.write("%s|%s\n" % (a, b))
+
+
+def pick_form(page):
+    forms = page.get("forms") or []
+    best = None
+    score = -1
+    for f in forms:
+        vis = [x for x in f["fields"] if x["type"] != "hidden" and x["name"]]
+        s = len(vis)
+        names = " ".join(x["name"].lower() for x in vis)
+        if "q" in names or "query" in names or "search" in names:
+            s += 5
+        if s > score:
+            best, score = f, s
+    if best:
+        return best
+    host = urllib.parse.urlparse(page.get("url") or "").netloc.lower()
+    if "google." in host:
+        return {
+            "action": "https://www.google.com/search",
+            "method": "get",
+            "fields": [{"name": "q", "type": "text", "value": "", "placeholder": "google"}],
+        }
+    if "duckduckgo" in host:
+        return {
+            "action": "https://lite.duckduckgo.com/lite/",
+            "method": "get",
+            "fields": [{"name": "q", "type": "text", "value": "", "placeholder": "search"}],
+        }
+    return {
+        "action": SEARCH.split("?")[0],
+        "method": "get",
+        "fields": [{"name": "q", "type": "text", "value": "", "placeholder": "search web"}],
+    }
+
+
+def submit_form(form, values):
+    data = []
+    for f in form["fields"]:
+        name = f["name"]
+        if not name:
+            continue
+        if name in values:
+            val = values[name]
+        else:
+            val = f.get("value") or ""
+        data.append((name, val))
+    q = urllib.parse.urlencode(data)
+    action = form["action"]
+    if form.get("method") == "post":
+        req = urllib.request.Request(action, data=q.encode("utf-8"), method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        resp = OPENER.open(req, timeout=12)
+        try:
+            raw = resp.read(MAX_BODY)
+            ctype = resp.headers.get("Content-Type") or "text/html"
+            final = resp.geturl()
+            JAR.save(ignore_discard=True, ignore_expires=True)
+            text = decode_body(raw, charset_from_header(ctype))
+        finally:
+            resp.close()
+        doc = Doc(final, reader=True)
+        try:
+            doc.feed(text)
+            doc.close()
+        except Exception:
+            pass
+        return {
+            "url": final,
+            "title": " ".join(doc.title.split()) or final,
+            "text": doc.finish(reader=True),
+            "links": doc.links,
+            "images": list(dict.fromkeys(doc.images))[:8],
+            "forms": doc.forms,
+        }
+    sep = "&" if "?" in action else "?"
+    return load_page(action + sep + q, reader=True)
 
 
 def thumb(url, max_px=64, max_b=20000):
@@ -360,6 +462,7 @@ def main():
     tagged = []
     find_at = "1.0"
     mode = "go"  # go | find | search
+    form_vars = []
 
     C = dict(bg="#0d1117", fg="#c9d1d9", dim="#8b949e", acc="#58a6ff",
              bar="#161b22", line="#30363d", hit="#5c4a00")
@@ -394,6 +497,8 @@ def main():
              anchor="w").pack(fill="x", padx=8, pady=(5, 2))
     row = tk.Frame(root, bg=C["bar"])
     row.pack(fill="x")
+    form_row = tk.Frame(root, bg=C["bar"])
+    form_row.pack(fill="x")
     tk.Frame(root, bg=C["line"], height=1).pack(fill="x")
 
     body = tk.Text(root, wrap="word", bd=0, highlightthickness=0, undo=False,
@@ -476,6 +581,37 @@ def main():
                     go(tagged[i])
                 return
 
+    def send_form(form, vars_map):
+        values = {k: v.get() for k, v in vars_map.items()}
+        say("submit")
+        root.update()
+        p = submit_form(form, values)
+        cache[(p["url"], reader)] = p
+        paint(p)
+
+    def rebuild_form(p):
+        nonlocal form_vars
+        for w in form_row.winfo_children():
+            w.destroy()
+        form_vars = []
+        form = pick_form(p)
+        vis = [f for f in form["fields"] if f["type"] != "hidden" and f["name"]][:2]
+        if not vis:
+            return
+        vars_map = {}
+        for f in vis:
+            tk.Label(form_row, text=(f["placeholder"] or f["name"])[:10],
+                     fg=C["dim"], bg=C["bar"]).pack(side="left", padx=(6, 2))
+            var = tk.StringVar(value=f.get("value") or "")
+            ent = tk.Entry(form_row, textvariable=var, insertbackground=C["fg"])
+            ent.pack(side="left", fill="x", expand=True, padx=2, ipady=2)
+            vars_map[f["name"]] = var
+            form_vars.append(ent)
+        tk.Button(form_row, text="search", padx=6,
+                  command=lambda: send_form(form, vars_map)).pack(side="left", padx=4)
+        if form_vars:
+            form_vars[0].bind("<Return>", lambda e: send_form(form, vars_map))
+
     def paint(p, splash=False):
         nonlocal page, tagged, photos, find_at
         page = p
@@ -489,6 +625,7 @@ def main():
             say("loading")
             root.update_idletasks()
             return
+        rebuild_form(p)
         body.delete("1.0", "end")
         for t in list(body.tag_names()):
             if t.startswith("n"):
