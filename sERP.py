@@ -347,7 +347,7 @@ class Pane:
                 blob = (sku + " " + str(it.get("name")) + " " + str(it.get("bin"))).lower()
                 if fl and fl not in blob:
                     continue
-                self.rows.append({"sku": sku, "line": line, "kind": "item"})
+                self.rows.append({"sku": sku, "line": line, "kind": "item", "low": flag == "!"})
         elif self.kind == "parties":
             for n, p in sorted(load_json(PARTIES).items()):
                 if fl and fl not in n.lower() and fl not in p.get("kind", ""):
@@ -410,6 +410,10 @@ class App:
         curses.init_pair(3, curses.COLOR_YELLOW, -1)
         curses.init_pair(4, curses.COLOR_WHITE, curses.COLOR_BLUE)
         curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_RED)
+        curses.init_pair(6, curses.COLOR_RED, -1)
+        curses.init_pair(7, curses.COLOR_GREEN, -1)
+        curses.init_pair(8, curses.COLOR_CYAN, -1)
+        curses.init_pair(9, curses.COLOR_BLACK, curses.COLOR_WHITE)
 
     def reload(self):
         for p in self.panes:
@@ -450,42 +454,86 @@ class App:
         pane.cursor = 0
         pane.reload()
 
+    def hdr(self, kind):
+        return {
+            "stock": "SKU     QTY   PRICE NAME",
+            "journal": "WHEN      TYPE WHAT",
+            "parties": "NAME         SALES/KIND",
+            "orders": "ID   TY PARTY    LINE",
+        }.get(kind, "")
+
+    def detail(self):
+        cur = self.pane.current()
+        sku = cur.get("sku")
+        if not sku:
+            return "no selection"
+        if self.pane.kind == "stock" or cur.get("kind") == "item":
+            it = item_get(sku) or {}
+            q = stock_map().get(sku, 0)
+            return "%s  %s  qty %d  $%s  min %s  bin %s" % (
+                sku, it.get("name") or "", q, money(it.get("price") or 0),
+                it.get("min") or 0, it.get("bin") or "-",
+            )
+        if self.pane.kind == "parties":
+            n, tot = party_sales(sku)
+            p = load_json(PARTIES).get(sku) or {}
+            return "%s  %s  %d so  %s" % (sku, p.get("kind"), n, money(tot))
+        return cur.get("line") or sku
+
+    def totals(self):
+        st = stock_map()
+        items = load_json(ITEMS)
+        val = sum(int((items.get(s) or {}).get("cost") or 0) * max(q, 0) for s, q in st.items())
+        skus = sum(1 for q in st.values() if q)
+        return "%d sku  onhand %s" % (skus, money(val))
+
     def draw(self):
         scr = self.scr
         h, w = scr.getmaxyx()
-        mid = w // 2
-        list_h = max(1, h - 4)
+        mid = max(16, w // 2)
+        list_h = max(1, h - 5)
         scr.erase()
-        put(scr, 0, 0, ("sERP  " + ROOT).ljust(w), curses.A_REVERSE)
+        clock = datetime.now().strftime("%H:%M")
+        put(scr, 0, 0, ("sERP  " + self.totals() + "  " + clock).ljust(w), curses.color_pair(4) | curses.A_BOLD)
         for pi, pane in enumerate(self.panes):
             x0 = 0 if pi == 0 else mid + 1
-            pw = mid if pi == 0 else w - mid - 1
-            title = ("[%s]" if pi == self.active else " %s ") % pane.kind.upper()
-            put(scr, 1, x0, title.ljust(max(0, pw)), curses.color_pair(4) if pi == self.active else curses.A_NORMAL)
-            vis = list_h
+            pw = mid if pi == 0 else max(1, w - mid - 1)
+            active = pi == self.active
+            tag = pane.kind.upper()
+            n = len(pane.rows)
+            title = "%s %d%s" % (tag, n, " /" + pane.filter if pane.filter else "")
+            bar = curses.color_pair(2) if active else curses.color_pair(4)
+            put(scr, 1, x0, title.ljust(pw), bar)
+            put(scr, 2, x0, self.hdr(pane.kind).ljust(pw), curses.color_pair(9))
+            vis = max(1, list_h - 1)
             if pane.cursor < pane.scroll:
                 pane.scroll = pane.cursor
             if pane.cursor >= pane.scroll + vis:
                 pane.scroll = pane.cursor - vis + 1
+            if not pane.rows:
+                put(scr, 3, x0, "(empty)", curses.color_pair(3))
             for i in range(vis):
                 idx = pane.scroll + i
                 if idx >= len(pane.rows):
                     break
+                row = pane.rows[idx]
                 attr = curses.A_NORMAL
-                if idx == pane.cursor and pi == self.active:
+                if row.get("low"):
+                    attr = curses.color_pair(6)
+                if pane.kind == "journal" and " so " in (" " + row["line"].lower() + " "):
+                    attr = curses.color_pair(7)
+                if idx == pane.cursor and active:
                     attr = curses.color_pair(2) | curses.A_BOLD
-                put(scr, 2 + i, x0, pane.rows[idx]["line"].ljust(pw), attr)
+                put(scr, 3 + i, x0, row["line"].ljust(pw), attr)
         if 0 < mid < w:
-            for y in range(1, list_h + 2):
+            for y in range(1, list_h + 3):
                 try:
                     scr.addch(y, mid, curses.ACS_VLINE)
                 except curses.error:
                     pass
-        cur = self.pane.current()
-        fl = (" /" + self.pane.filter) if self.pane.filter else ""
-        put(scr, h - 3, 0, ("sel " + (cur.get("sku") or "-") + fl + "  tab  t list").ljust(w), curses.color_pair(4))
-        put(scr, h - 2, 0, (self.msg or NAME).ljust(w), curses.color_pair(5) if self.err else curses.color_pair(4))
-        put(scr, h - 1, 0, "F1? F2 itm F3 pty F4 ed F5 in F6 out F7 so F8 adj F9 po F10", curses.A_REVERSE)
+        put(scr, h - 3, 0, self.detail().ljust(w), curses.color_pair(4))
+        put(scr, h - 2, 0, (self.msg or NAME).ljust(w), curses.color_pair(5) if self.err else curses.color_pair(8))
+        put(scr, h - 1, 0, "1Help 2Item 3Party 4Edit 5In 6Out 7Sale 8Adj 9Buy 10Quit", curses.A_REVERSE)
         scr.refresh()
 
     def help_screen(self):
