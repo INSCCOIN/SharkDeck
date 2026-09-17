@@ -260,7 +260,22 @@ PANES = ("stock", "parties", "journal", "orders")
 
 def clip(s, n):
     s = " ".join(str(s).split())
+    if n <= 1:
+        return ""
     return s if len(s) <= n else s[: n - 1] + "~"
+
+
+def put(stdscr, y, x, text, attr=0):
+    try:
+        h, w = stdscr.getmaxyx()
+        if y < 0 or x < 0 or y >= h or x >= w:
+            return
+        room = w - x - (1 if y == h - 1 else 0)
+        if room <= 0:
+            return
+        stdscr.addnstr(y, x, clip(text, room), room, attr)
+    except curses.error:
+        pass
 
 
 class UI:
@@ -326,8 +341,8 @@ class UI:
         curses.echo()
         curses.curs_set(1)
         h, w = stdscr.getmaxyx()
-        stdscr.addnstr(h - 1, 0, " " * w, w)
-        stdscr.addnstr(h - 1, 0, (title + " ")[:w], w)
+        put(stdscr, h - 1, 0, " " * max(0, w - 1))
+        put(stdscr, h - 1, 0, title + " ")
         stdscr.refresh()
         try:
             raw = stdscr.getstr(h - 1, min(w - 2, len(title) + 1), max(8, w - 12))
@@ -345,7 +360,7 @@ class UI:
         tabs = " ".join(
             ("[%s]" % p.upper() if i == self.pane else p) for i, p in enumerate(PANES)
         )
-        stdscr.addnstr(0, 0, clip(NAME + "  " + tabs, w).ljust(w)[:w], w, curses.A_REVERSE)
+        put(stdscr, 0, 0, (NAME + "  " + tabs).ljust(w), curses.A_REVERSE)
         left_h = h - 2
         top = 0
         if self.cur >= top + left_h:
@@ -355,7 +370,7 @@ class UI:
             if idx >= len(self.rows):
                 break
             attr = curses.A_REVERSE if idx == self.cur else curses.A_NORMAL
-            stdscr.addnstr(1 + i, 0, clip(self.rows[idx]["line"], mid - 1).ljust(mid - 1)[: mid - 1], mid - 1, attr)
+            put(stdscr, 1 + i, 0, self.rows[idx]["line"].ljust(mid - 1), attr)
         det = ""
         if self.rows:
             det = self.rows[self.cur]["detail"]
@@ -363,10 +378,10 @@ class UI:
         for line in det.splitlines():
             if dy >= h - 1:
                 break
-            stdscr.addnstr(dy, mid, clip(line, w - mid)[: w - mid], w - mid)
+            put(stdscr, dy, mid, line)
             dy += 1
         helpbar = "tab pane  a add  r recv  s ship  o sale  q"
-        stdscr.addnstr(h - 1, 0, clip(self.msg + "  |  " + helpbar, w).ljust(w)[:w], w, curses.A_REVERSE)
+        put(stdscr, h - 1, 0, (self.msg + " | " + helpbar).ljust(w), curses.A_REVERSE)
         stdscr.refresh()
 
     def add_item(self, stdscr):
